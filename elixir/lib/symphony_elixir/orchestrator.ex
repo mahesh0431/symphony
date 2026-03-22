@@ -8,6 +8,7 @@ defmodule SymphonyElixir.Orchestrator do
   import Bitwise, only: [<<<: 2]
 
   alias SymphonyElixir.{AgentRunner, Config, StatusDashboard, Tracker, Workspace}
+  alias SymphonyElixir.GitHub.Issue, as: GitHubIssue
   alias SymphonyElixir.Linear.Issue
 
   @continuation_retry_delay_ms 1_000
@@ -26,6 +27,21 @@ defmodule SymphonyElixir.Orchestrator do
     Runtime state for the orchestrator polling loop.
     """
 
+    @type t :: %__MODULE__{
+            poll_interval_ms: non_neg_integer() | nil,
+            max_concurrent_agents: non_neg_integer() | nil,
+            next_poll_due_at_ms: integer() | nil,
+            poll_check_in_progress: boolean() | nil,
+            tick_timer_ref: reference() | nil,
+            tick_token: reference() | nil,
+            running: map(),
+            completed: MapSet.t(),
+            claimed: MapSet.t(),
+            retry_attempts: map(),
+            codex_totals: map() | nil,
+            codex_rate_limits: map() | nil
+          }
+
     defstruct [
       :poll_interval_ms,
       :max_concurrent_agents,
@@ -41,6 +57,9 @@ defmodule SymphonyElixir.Orchestrator do
       codex_rate_limits: nil
     ]
   end
+
+  defguardp is_tracker_issue(issue)
+            when is_struct(issue, Issue) or is_struct(issue, GitHubIssue)
 
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts \\ []) do
@@ -224,52 +243,66 @@ defmodule SymphonyElixir.Orchestrator do
   defp maybe_dispatch(%State{} = state) do
     state = reconcile_running_issues(state)
 
-    with :ok <- Config.validate!(),
-         {:ok, issues} <- Tracker.fetch_candidate_issues(),
-         true <- available_slots(state) > 0 do
-      choose_issues(issues, state)
-    else
-      {:error, :missing_linear_api_token} ->
-        Logger.error("Linear API token missing in WORKFLOW.md")
-        state
+    case Config.validate!() do
+      :ok ->
+        maybe_poll_candidates(state)
 
-      {:error, :missing_linear_project_slug} ->
-        Logger.error("Linear project slug missing in WORKFLOW.md")
-        state
-
-      {:error, :missing_tracker_kind} ->
-        Logger.error("Tracker kind missing in WORKFLOW.md")
-
-        state
-
-      {:error, {:unsupported_tracker_kind, kind}} ->
-        Logger.error("Unsupported tracker kind in WORKFLOW.md: #{inspect(kind)}")
-
-        state
-
-      {:error, {:invalid_workflow_config, message}} ->
-        Logger.error("Invalid WORKFLOW.md config: #{message}")
-        state
-
-      {:error, {:missing_workflow_file, path, reason}} ->
-        Logger.error("Missing WORKFLOW.md at #{path}: #{inspect(reason)}")
-        state
-
-      {:error, :workflow_front_matter_not_a_map} ->
-        Logger.error("Failed to parse WORKFLOW.md: workflow front matter must decode to a map")
-        state
-
-      {:error, {:workflow_parse_error, reason}} ->
-        Logger.error("Failed to parse WORKFLOW.md: #{inspect(reason)}")
-        state
-
-      {:error, reason} ->
-        Logger.error("Failed to fetch from Linear: #{inspect(reason)}")
-        state
-
-      false ->
+      error ->
+        log_config_validation_error(error)
         state
     end
+  end
+
+  defp maybe_poll_candidates(state) do
+    if should_poll_candidates?(state) do
+      case Tracker.fetch_candidate_issues() do
+        {:ok, issues} ->
+          choose_issues(issues, state)
+
+        {:error, reason} ->
+          Logger.error("Failed to fetch from #{tracker_log_label()}: #{inspect(reason)}")
+          state
+      end
+    else
+      Logger.debug("Skipping #{tracker_log_label()} candidate poll because no orchestrator slots are free")
+      state
+    end
+  end
+
+  defp log_config_validation_error({:error, :missing_linear_api_token}) do
+    Logger.error("Linear API token missing in WORKFLOW.md")
+  end
+
+  defp log_config_validation_error({:error, :missing_linear_project_slug}) do
+    Logger.error("Linear project slug missing in WORKFLOW.md")
+  end
+
+  defp log_config_validation_error({:error, :missing_tracker_kind}) do
+    Logger.error("Tracker kind missing in WORKFLOW.md")
+  end
+
+  defp log_config_validation_error({:error, {:unsupported_tracker_kind, kind}}) do
+    Logger.error("Unsupported tracker kind in WORKFLOW.md: #{inspect(kind)}")
+  end
+
+  defp log_config_validation_error({:error, {:invalid_workflow_config, message}}) do
+    Logger.error("Invalid WORKFLOW.md config: #{message}")
+  end
+
+  defp log_config_validation_error({:error, {:missing_workflow_file, path, reason}}) do
+    Logger.error("Missing WORKFLOW.md at #{path}: #{inspect(reason)}")
+  end
+
+  defp log_config_validation_error({:error, :workflow_front_matter_not_a_map}) do
+    Logger.error("Failed to parse WORKFLOW.md: workflow front matter must decode to a map")
+  end
+
+  defp log_config_validation_error({:error, {:workflow_parse_error, reason}}) do
+    Logger.error("Failed to parse WORKFLOW.md: #{inspect(reason)}")
+  end
+
+  defp log_config_validation_error({:error, reason}) do
+    Logger.error("Tracker validation failed in WORKFLOW.md: #{inspect(reason)}")
   end
 
   defp reconcile_running_issues(%State{} = state) do
@@ -298,7 +331,7 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   @doc false
-  @spec reconcile_issue_states_for_test([Issue.t()], term()) :: term()
+  @spec reconcile_issue_states_for_test([Issue.t() | GitHubIssue.t()], term()) :: term()
   def reconcile_issue_states_for_test(issues, %State{} = state) when is_list(issues) do
     reconcile_running_issue_states(issues, state, active_state_set(), terminal_state_set())
   end
@@ -308,21 +341,32 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   @doc false
-  @spec should_dispatch_issue_for_test(Issue.t(), term()) :: boolean()
-  def should_dispatch_issue_for_test(%Issue{} = issue, %State{} = state) do
+  @spec should_dispatch_issue_for_test(Issue.t() | GitHubIssue.t(), term()) :: boolean()
+  def should_dispatch_issue_for_test(issue, %State{} = state) when is_tracker_issue(issue) do
     should_dispatch_issue?(issue, state, active_state_set(), terminal_state_set())
   end
 
   @doc false
-  @spec revalidate_issue_for_dispatch_for_test(Issue.t(), ([String.t()] -> term())) ::
-          {:ok, Issue.t()} | {:skip, Issue.t() | :missing} | {:error, term()}
-  def revalidate_issue_for_dispatch_for_test(%Issue{} = issue, issue_fetcher)
-      when is_function(issue_fetcher, 1) do
+  @spec should_poll_candidates_for_test(State.t()) :: boolean()
+  def should_poll_candidates_for_test(%State{} = state) do
+    should_poll_candidates?(state)
+  end
+
+  @doc false
+  @spec revalidate_issue_for_dispatch_for_test(
+          Issue.t() | GitHubIssue.t(),
+          ([String.t()] -> term())
+        ) ::
+          {:ok, Issue.t() | GitHubIssue.t()}
+          | {:skip, Issue.t() | GitHubIssue.t() | :missing}
+          | {:error, term()}
+  def revalidate_issue_for_dispatch_for_test(issue, issue_fetcher)
+      when is_tracker_issue(issue) and is_function(issue_fetcher, 1) do
     revalidate_issue_for_dispatch(issue, issue_fetcher, terminal_state_set())
   end
 
   @doc false
-  @spec sort_issues_for_dispatch_for_test([Issue.t()]) :: [Issue.t()]
+  @spec sort_issues_for_dispatch_for_test([Issue.t() | GitHubIssue.t()]) :: [Issue.t() | GitHubIssue.t()]
   def sort_issues_for_dispatch_for_test(issues) when is_list(issues) do
     sort_issues_for_dispatch(issues)
   end
@@ -344,7 +388,8 @@ defmodule SymphonyElixir.Orchestrator do
     )
   end
 
-  defp reconcile_issue_state(%Issue{} = issue, state, active_states, terminal_states) do
+  defp reconcile_issue_state(issue, state, active_states, terminal_states)
+       when is_tracker_issue(issue) do
     cond do
       terminal_issue_state?(issue.state, terminal_states) ->
         Logger.info("Issue moved to terminal state: #{issue_context(issue)} state=#{issue.state}; stopping active agent")
@@ -373,7 +418,7 @@ defmodule SymphonyElixir.Orchestrator do
     visible_issue_ids =
       issues
       |> Enum.flat_map(fn
-        %Issue{id: issue_id} when is_binary(issue_id) -> [issue_id]
+        %{id: issue_id} = issue when is_tracker_issue(issue) and is_binary(issue_id) -> [issue_id]
         _ -> []
       end)
       |> MapSet.new()
@@ -402,7 +447,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp log_missing_running_issue(_state, _issue_id), do: :ok
 
-  defp refresh_running_issue_state(%State{} = state, %Issue{} = issue) do
+  defp refresh_running_issue_state(%State{} = state, issue) when is_tracker_issue(issue) do
     case Map.get(state.running, issue.id) do
       %{issue: _} = running_entry ->
         %{state | running: Map.put(state.running, issue.id, %{running_entry | issue: issue})}
@@ -533,7 +578,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp sort_issues_for_dispatch(issues) when is_list(issues) do
     Enum.sort_by(issues, fn
-      %Issue{} = issue ->
+      issue when is_tracker_issue(issue) ->
         {priority_rank(issue.priority), issue_created_at_sort_key(issue), issue.identifier || issue.id || ""}
 
       _ ->
@@ -544,19 +589,21 @@ defmodule SymphonyElixir.Orchestrator do
   defp priority_rank(priority) when is_integer(priority) and priority in 1..4, do: priority
   defp priority_rank(_priority), do: 5
 
-  defp issue_created_at_sort_key(%Issue{created_at: %DateTime{} = created_at}) do
+  defp issue_created_at_sort_key(%{created_at: %DateTime{} = created_at} = issue)
+       when is_tracker_issue(issue) do
     DateTime.to_unix(created_at, :microsecond)
   end
 
-  defp issue_created_at_sort_key(%Issue{}), do: 9_223_372_036_854_775_807
+  defp issue_created_at_sort_key(issue) when is_tracker_issue(issue), do: 9_223_372_036_854_775_807
   defp issue_created_at_sort_key(_issue), do: 9_223_372_036_854_775_807
 
   defp should_dispatch_issue?(
-         %Issue{} = issue,
+         issue,
          %State{running: running, claimed: claimed} = state,
          active_states,
          terminal_states
-       ) do
+       )
+       when is_tracker_issue(issue) do
     candidate_issue?(issue, active_states, terminal_states) and
       !todo_issue_blocked_by_non_terminal?(issue, terminal_states) and
       !MapSet.member?(claimed, issue.id) and
@@ -568,7 +615,8 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp should_dispatch_issue?(_issue, _state, _active_states, _terminal_states), do: false
 
-  defp state_slots_available?(%Issue{state: issue_state}, running) when is_map(running) do
+  defp state_slots_available?(issue, running) when is_tracker_issue(issue) and is_map(running) do
+    issue_state = issue.state
     limit = Config.max_concurrent_agents_for_state(issue_state)
     used = running_issue_count_for_state(running, issue_state)
     limit > used
@@ -580,7 +628,7 @@ defmodule SymphonyElixir.Orchestrator do
     normalized_state = normalize_issue_state(issue_state)
 
     Enum.count(running, fn
-      {_id, %{issue: %Issue{state: state_name}}} ->
+      {_id, %{issue: %{state: state_name} = issue}} when is_tracker_issue(issue) ->
         normalize_issue_state(state_name) == normalized_state
 
       _ ->
@@ -588,43 +636,33 @@ defmodule SymphonyElixir.Orchestrator do
     end)
   end
 
-  defp candidate_issue?(
-         %Issue{
-           id: id,
-           identifier: identifier,
-           title: title,
-           state: state_name
-         } = issue,
-         active_states,
-         terminal_states
-       )
-       when is_binary(id) and is_binary(identifier) and is_binary(title) and is_binary(state_name) do
-    issue_routable_to_worker?(issue) and
+  defp candidate_issue?(issue, active_states, terminal_states) when is_tracker_issue(issue) do
+    id = issue.id
+    identifier = issue.identifier
+    title = issue.title
+    state_name = issue.state
+
+    is_binary(id) and is_binary(identifier) and is_binary(title) and is_binary(state_name) and
+      issue_routable_to_worker?(issue) and
       active_issue_state?(state_name, active_states) and
       !terminal_issue_state?(state_name, terminal_states)
   end
 
   defp candidate_issue?(_issue, _active_states, _terminal_states), do: false
 
-  defp issue_routable_to_worker?(%Issue{assigned_to_worker: assigned_to_worker})
-       when is_boolean(assigned_to_worker),
+  defp issue_routable_to_worker?(%{assigned_to_worker: assigned_to_worker} = issue)
+       when is_tracker_issue(issue) and is_boolean(assigned_to_worker),
        do: assigned_to_worker
 
   defp issue_routable_to_worker?(_issue), do: true
 
-  defp todo_issue_blocked_by_non_terminal?(
-         %Issue{state: issue_state, blocked_by: blockers},
-         terminal_states
-       )
-       when is_binary(issue_state) and is_list(blockers) do
-    normalize_issue_state(issue_state) == "todo" and
-      Enum.any?(blockers, fn
-        %{state: blocker_state} when is_binary(blocker_state) ->
-          !terminal_issue_state?(blocker_state, terminal_states)
+  defp todo_issue_blocked_by_non_terminal?(issue, terminal_states) when is_tracker_issue(issue) do
+    issue_state = issue.state
+    blockers = issue.blocked_by
 
-        _ ->
-          true
-      end)
+    is_binary(issue_state) and is_list(blockers) and
+      normalize_issue_state(issue_state) == "todo" and
+      Enum.any?(blockers, &blocker_blocks_dispatch?(&1, issue, terminal_states))
   end
 
   defp todo_issue_blocked_by_non_terminal?(_issue, _terminal_states), do: false
@@ -636,11 +674,45 @@ defmodule SymphonyElixir.Orchestrator do
   defp terminal_issue_state?(_state_name, _terminal_states), do: false
 
   defp active_issue_state?(state_name, active_states) when is_binary(state_name) do
-    MapSet.member?(active_states, normalize_issue_state(state_name))
+    normalized_state = normalize_issue_state(state_name)
+
+    MapSet.member?(active_states, normalized_state) and
+      !(github_tracker_mode?() and non_runnable_github_state?(normalized_state))
   end
 
   defp normalize_issue_state(state_name) when is_binary(state_name) do
     String.downcase(String.trim(state_name))
+  end
+
+  defp blocker_blocks_dispatch?(blocker, issue, terminal_states)
+       when is_map(blocker) and is_tracker_issue(issue) do
+    if github_tracker_issue?(issue) do
+      !github_blocker_completed?(blocker)
+    else
+      blocker_terminal_for_tracker?(blocker, terminal_states) == false
+    end
+  end
+
+  defp blocker_blocks_dispatch?(_blocker, _issue, _terminal_states), do: true
+
+  defp blocker_terminal_for_tracker?(%{state: blocker_state}, terminal_states)
+       when is_binary(blocker_state) do
+    terminal_issue_state?(blocker_state, terminal_states)
+  end
+
+  defp blocker_terminal_for_tracker?(_blocker, _terminal_states), do: false
+
+  defp github_blocker_completed?(blocker) when is_map(blocker) do
+    normalize_issue_state(blocker_value(blocker, :state)) == "closed" and
+      normalize_issue_state(blocker_value(blocker, :state_reason)) == "completed"
+  end
+
+  defp blocker_value(blocker, key) do
+    Map.get(blocker, key) || Map.get(blocker, Atom.to_string(key))
+  end
+
+  defp non_runnable_github_state?(state_name) when is_binary(state_name) do
+    state_name in ["backlog", "human review"]
   end
 
   defp terminal_state_set do
@@ -659,14 +731,14 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp dispatch_issue(%State{} = state, issue, attempt \\ nil, preferred_worker_host \\ nil) do
     case revalidate_issue_for_dispatch(issue, &Tracker.fetch_issue_states_by_ids/1, terminal_state_set()) do
-      {:ok, %Issue{} = refreshed_issue} ->
+      {:ok, refreshed_issue} when is_tracker_issue(refreshed_issue) ->
         do_dispatch_issue(state, refreshed_issue, attempt, preferred_worker_host)
 
       {:skip, :missing} ->
         Logger.info("Skipping dispatch; issue no longer active or visible: #{issue_context(issue)}")
         state
 
-      {:skip, %Issue{} = refreshed_issue} ->
+      {:skip, refreshed_issue} when is_tracker_issue(refreshed_issue) ->
         Logger.info("Skipping stale dispatch after issue refresh: #{issue_context(refreshed_issue)} state=#{inspect(refreshed_issue.state)} blocked_by=#{length(refreshed_issue.blocked_by)}")
 
         state
@@ -742,10 +814,10 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp revalidate_issue_for_dispatch(%Issue{id: issue_id}, issue_fetcher, terminal_states)
-       when is_binary(issue_id) and is_function(issue_fetcher, 1) do
+  defp revalidate_issue_for_dispatch(%{id: issue_id} = issue, issue_fetcher, terminal_states)
+       when is_tracker_issue(issue) and is_binary(issue_id) and is_function(issue_fetcher, 1) do
     case issue_fetcher.([issue_id]) do
-      {:ok, [%Issue{} = refreshed_issue | _]} ->
+      {:ok, [refreshed_issue | _]} when is_tracker_issue(refreshed_issue) ->
         if retry_candidate_issue?(refreshed_issue, terminal_states) do
           {:ok, refreshed_issue}
         else
@@ -846,7 +918,8 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp handle_retry_issue_lookup(%Issue{} = issue, state, issue_id, attempt, metadata) do
+  defp handle_retry_issue_lookup(issue, state, issue_id, attempt, metadata)
+       when is_tracker_issue(issue) do
     terminal_states = terminal_state_set()
 
     cond do
@@ -884,7 +957,7 @@ defmodule SymphonyElixir.Orchestrator do
       {:ok, issues} ->
         issues
         |> Enum.each(fn
-          %Issue{identifier: identifier} when is_binary(identifier) ->
+          %{identifier: identifier} = issue when is_tracker_issue(issue) and is_binary(identifier) ->
             cleanup_issue_workspace(identifier)
 
           _ ->
@@ -1034,7 +1107,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp find_issue_by_id(issues, issue_id) when is_binary(issue_id) do
     Enum.find(issues, fn
-      %Issue{id: ^issue_id} ->
+      %{id: ^issue_id} = issue when is_tracker_issue(issue) ->
         true
 
       _ ->
@@ -1054,7 +1127,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp running_entry_session_id(_running_entry), do: "n/a"
 
-  defp issue_context(%Issue{id: issue_id, identifier: identifier}) do
+  defp issue_context(%{id: issue_id, identifier: identifier} = issue) when is_tracker_issue(issue) do
     "issue_id=#{issue_id} issue_identifier=#{identifier}"
   end
 
@@ -1303,14 +1376,29 @@ defmodule SymphonyElixir.Orchestrator do
     }
   end
 
-  defp retry_candidate_issue?(%Issue{} = issue, terminal_states) do
+  defp retry_candidate_issue?(issue, terminal_states) when is_tracker_issue(issue) do
     candidate_issue?(issue, active_state_set(), terminal_states) and
       !todo_issue_blocked_by_non_terminal?(issue, terminal_states)
   end
 
-  defp dispatch_slots_available?(%Issue{} = issue, %State{} = state) do
+  defp dispatch_slots_available?(issue, %State{} = state) when is_tracker_issue(issue) do
     available_slots(state) > 0 and state_slots_available?(issue, state.running)
   end
+
+  defp should_poll_candidates?(%State{} = state) do
+    !github_tracker_mode?() or available_slots(state) > 0
+  end
+
+  defp github_tracker_mode? do
+    Config.settings!().tracker.kind == "github"
+  end
+
+  defp tracker_log_label do
+    if github_tracker_mode?(), do: "GitHub", else: "Linear"
+  end
+
+  defp github_tracker_issue?(%GitHubIssue{}), do: true
+  defp github_tracker_issue?(_issue), do: false
 
   defp apply_codex_token_delta(
          %{codex_totals: codex_totals} = state,

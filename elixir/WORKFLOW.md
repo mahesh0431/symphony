@@ -69,7 +69,29 @@ Instructions:
 
 Work only in the provided repository copy. Do not touch any other path.
 
-## Prerequisite: Linear MCP or `linear_graphql` tool is available
+## GitHub prompt guidance
+
+For GitHub tracker runs, provide an explicit Markdown prompt body that references repository metadata instead of relying on the Linear fallback prompt. A minimal shape is:
+
+```md
+# GitHub Issue
+
+- Identifier: {{ issue.identifier }}
+- Repository: {{ repository.name_with_owner }}
+- Default branch: {{ repository.default_branch }}
+- Issue URL: {{ issue.url }}
+
+## Description
+{% if issue.description %}
+{{ issue.description }}
+{% else %}
+No description provided.
+{% endif %}
+```
+
+GitHub mode does not require or inject `linear_graphql`, and v1 does not inject a GitHub-specific dynamic tool either.
+
+## Prerequisite: Linear MCP or `linear_graphql` tool is available (Linear only)
 
 The agent should be able to talk to Linear, either via a configured Linear MCP server or injected `linear_graphql` tool. If none are present, stop and ask the user to configure Linear.
 

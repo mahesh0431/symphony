@@ -3,6 +3,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
   alias Ecto.Changeset
   alias SymphonyElixir.Config.Schema
   alias SymphonyElixir.Config.Schema.{Codex, StringOrMap}
+  alias SymphonyElixir.GitHub.Issue, as: GitHubIssue
   alias SymphonyElixir.Linear.Client
 
   test "workspace bootstrap can be implemented in after_create hook" do
@@ -37,6 +38,121 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       assert File.read!(Path.join([workspace, "keep", "file.txt"])) == "keep me"
     after
       File.rm_rf(test_root)
+    end
+  end
+
+  test "workspace bootstraps github repositories from issue metadata before after_create hooks" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-workspace-github-bootstrap-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      template_repo = Path.join(test_root, "source")
+      workspace_root = Path.join(test_root, "workspaces")
+
+      File.mkdir_p!(template_repo)
+      File.write!(Path.join(template_repo, "README.md"), "github bootstrap\n")
+      System.cmd("git", ["-C", template_repo, "init", "-b", "main"])
+      System.cmd("git", ["-C", template_repo, "config", "user.name", "Test User"])
+      System.cmd("git", ["-C", template_repo, "config", "user.email", "test@example.com"])
+      System.cmd("git", ["-C", template_repo, "add", "README.md"])
+      System.cmd("git", ["-C", template_repo, "commit", "-m", "initial"])
+
+      write_raw_workflow_file!(
+        Workflow.workflow_file_path(),
+        github_workflow_content(workspace_root,
+          prompt: "   \n",
+          hook_after_create: "test -f README.md\nprintf '%s' after-create > after_create.log"
+        )
+      )
+
+      issue = %{
+        id: "issue-1",
+        identifier: "octo-org/example#1",
+        title: "Bootstrap repo",
+        repository_name_with_owner: "octo-org/example",
+        repository_url: "https://github.com/octo-org/example",
+        repository_ssh_url: "git@github.com:octo-org/example.git",
+        repository_default_branch: "main",
+        project_item_id: "item-1",
+        tracker_metadata: %{"clone_url" => template_repo}
+      }
+
+      assert {:ok, workspace} = Workspace.create_for_issue(issue)
+      assert File.exists?(Path.join(workspace, ".git"))
+      assert File.read!(Path.join(workspace, "README.md")) == "github bootstrap\n"
+      assert File.read!(Path.join(workspace, "after_create.log")) == "after-create"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "workspace prefers the https repository url before the ssh url for github bootstrap" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-workspace-github-https-bootstrap-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      template_repo = Path.join(test_root, "source")
+      workspace_root = Path.join(test_root, "workspaces")
+
+      File.mkdir_p!(template_repo)
+      File.write!(Path.join(template_repo, "README.md"), "github https bootstrap\n")
+      System.cmd("git", ["-C", template_repo, "init", "-b", "main"])
+      System.cmd("git", ["-C", template_repo, "config", "user.name", "Test User"])
+      System.cmd("git", ["-C", template_repo, "config", "user.email", "test@example.com"])
+      System.cmd("git", ["-C", template_repo, "add", "README.md"])
+      System.cmd("git", ["-C", template_repo, "commit", "-m", "initial"])
+
+      write_raw_workflow_file!(
+        Workflow.workflow_file_path(),
+        github_workflow_content(workspace_root, prompt: "   \n")
+      )
+
+      issue = %GitHubIssue{
+        id: "issue-https",
+        identifier: "octo-org/example#2",
+        title: "Bootstrap via https",
+        repository_name_with_owner: "octo-org/example",
+        repository_url: template_repo,
+        repository_ssh_url: "git@github.com:octo-org/example.git",
+        repository_default_branch: "main",
+        project_item_id: "item-https"
+      }
+
+      assert {:ok, workspace} = Workspace.create_for_issue(issue)
+      assert File.exists?(Path.join(workspace, ".git"))
+      assert File.read!(Path.join(workspace, "README.md")) == "github https bootstrap\n"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "workspace fails safely when a github issue is not linked to a repository" do
+    workspace_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-workspace-github-missing-repo-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      write_raw_workflow_file!(Workflow.workflow_file_path(), github_workflow_content(workspace_root))
+
+      issue = %GitHubIssue{
+        id: "issue-2",
+        identifier: "octo-org/example#2",
+        title: "Missing repo",
+        project_item_id: "item-404"
+      }
+
+      assert {:error, {:github_issue_repository_missing, "item-404"}} =
+               Workspace.create_for_issue(issue)
+    after
+      File.rm_rf(workspace_root)
     end
   end
 
@@ -1046,6 +1162,37 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert settings.workspace.root == Path.join(System.tmp_dir!(), "symphony_workspaces")
   end
 
+  test "schema falls back to default tracker endpoints for blank literal and empty env values" do
+    empty_endpoint_env = "SYMP_EMPTY_ENDPOINT_#{System.unique_integer([:positive])}"
+    previous_empty_endpoint_env = System.get_env(empty_endpoint_env)
+    System.put_env(empty_endpoint_env, "")
+
+    on_exit(fn ->
+      restore_env(empty_endpoint_env, previous_empty_endpoint_env)
+    end)
+
+    assert {:ok, github_settings} =
+             Schema.parse(%{
+               tracker: %{kind: "github", endpoint: "   "}
+             })
+
+    assert github_settings.tracker.endpoint == "https://api.github.com/graphql"
+
+    assert {:ok, github_env_settings} =
+             Schema.parse(%{
+               tracker: %{kind: "github", endpoint: "$#{empty_endpoint_env}"}
+             })
+
+    assert github_env_settings.tracker.endpoint == "https://api.github.com/graphql"
+
+    assert {:ok, linear_settings} =
+             Schema.parse(%{
+               tracker: %{endpoint: "$#{empty_endpoint_env}"}
+             })
+
+    assert linear_settings.tracker.endpoint == "https://api.linear.app/graphql"
+  end
+
   test "schema resolves sandbox policies from explicit and default workspaces" do
     explicit_policy = %{"type" => "workspaceWrite", "writableRoots" => ["/tmp/explicit"]}
 
@@ -1229,6 +1376,87 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert Config.workflow_prompt() == workflow_prompt
   end
 
+  test "prompt builder exposes github repository variables" do
+    workflow_prompt =
+      "Repo {{ repository.name_with_owner }} branch {{ repository.default_branch }} item {{ project.item_id }} issue {{ issue.identifier }}"
+
+    write_raw_workflow_file!(
+      Workflow.workflow_file_path(),
+      github_workflow_content(Path.join(System.tmp_dir!(), "prompt-vars"), prompt: workflow_prompt)
+    )
+
+    issue = %GitHubIssue{
+      id: "issue-3",
+      identifier: "octo-org/example#3",
+      title: "Prompt vars",
+      repository_name_with_owner: "octo-org/example",
+      repository_url: "https://github.com/octo-org/example",
+      repository_ssh_url: "git@github.com:octo-org/example.git",
+      repository_default_branch: "main",
+      project_item_id: "item-3"
+    }
+
+    prompt = PromptBuilder.build_prompt(issue)
+
+    assert prompt == "Repo octo-org/example branch main item item-3 issue octo-org/example#3"
+  end
+
+  test "prompt builder uses a github-specific markdown default prompt when workflow prompt is blank" do
+    write_raw_workflow_file!(
+      Workflow.workflow_file_path(),
+      github_workflow_content(Path.join(System.tmp_dir!(), "prompt-default"), prompt: "   \n")
+    )
+
+    issue = %GitHubIssue{
+      id: "issue-4",
+      identifier: "octo-org/example#4",
+      title: "Prompt default",
+      description: "Use the repository-aware default.",
+      repository_name_with_owner: "octo-org/example",
+      repository_url: "https://github.com/octo-org/example",
+      repository_ssh_url: "git@github.com:octo-org/example.git",
+      repository_default_branch: "main",
+      url: "https://github.com/octo-org/example/issues/4"
+    }
+
+    prompt = PromptBuilder.build_prompt(issue)
+
+    assert prompt =~ "# GitHub Issue"
+    assert prompt =~ "Repository: octo-org/example"
+    assert prompt =~ "Default branch: main"
+    assert prompt =~ "Issue URL: https://github.com/octo-org/example/issues/4"
+    assert prompt =~ "GitHub v1 does not inject a GitHub-specific dynamic tool"
+    assert prompt =~ "Use the repository-aware default."
+    refute prompt =~ "Linear issue"
+  end
+
+  test "prompt builder infers github tracker kind from plain issue maps" do
+    workflow_prompt = "Kind {{ tracker.kind }} Repo {{ repository.name_with_owner }} Title {{ issue.title }}"
+
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory", prompt: workflow_prompt)
+
+    prompt =
+      PromptBuilder.build_prompt(%{
+        "title" => "Map-backed issue",
+        "repository_name_with_owner" => "octo-org/example"
+      })
+
+    assert prompt == "Kind github Repo octo-org/example Title Map-backed issue"
+  end
+
+  test "prompt builder falls back to workflow tracker kind for plain issue maps without repo metadata" do
+    workflow_prompt = "Kind {{ tracker.kind }} Title {{ issue.title }}"
+
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory", prompt: workflow_prompt)
+
+    prompt =
+      PromptBuilder.build_prompt(%{
+        "title" => "Memory issue"
+      })
+
+    assert prompt == "Kind memory Title Memory issue"
+  end
+
   test "remote workspace lifecycle uses ssh host aliases from worker config" do
     test_root =
       Path.join(
@@ -1298,5 +1526,50 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     after
       File.rm_rf(test_root)
     end
+  end
+
+  defp write_raw_workflow_file!(path, contents) do
+    File.write!(path, contents)
+
+    if Process.whereis(SymphonyElixir.WorkflowStore) do
+      SymphonyElixir.WorkflowStore.force_reload()
+    end
+
+    :ok
+  end
+
+  defp github_workflow_content(workspace_root, opts \\ []) do
+    prompt = Keyword.get(opts, :prompt, "   \n")
+    hook_after_create = Keyword.get(opts, :hook_after_create)
+
+    [
+      "---",
+      "tracker:",
+      "  kind: \"github\"",
+      "  endpoint: \"https://api.github.com/graphql\"",
+      "  api_key: \"token\"",
+      "  owner: {\"login\": \"octo-org\", \"type\": \"organization\"}",
+      "  projects: [{\"number\": 1}]",
+      "  status_field_name: \"Status\"",
+      "  workpad_comment: \"## Codex Workpad\"",
+      "workspace:",
+      "  root: \"#{workspace_root}\"",
+      "hooks:",
+      "  timeout_ms: 60000",
+      hook_after_create && "  after_create: |\n" <> indent_block(hook_after_create, 4),
+      "---",
+      prompt
+    ]
+    |> Enum.reject(&(&1 in [nil, false]))
+    |> Enum.join("\n")
+    |> Kernel.<>("\n")
+  end
+
+  defp indent_block(contents, spaces) when is_binary(contents) do
+    indent = String.duplicate(" ", spaces)
+
+    contents
+    |> String.split("\n")
+    |> Enum.map_join("\n", &(indent <> &1))
   end
 end

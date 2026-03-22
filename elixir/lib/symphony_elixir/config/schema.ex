@@ -49,6 +49,10 @@ defmodule SymphonyElixir.Config.Schema do
       field(:endpoint, :string, default: "https://api.linear.app/graphql")
       field(:api_key, :string)
       field(:project_slug, :string)
+      field(:owner, StringOrMap)
+      field(:projects, {:array, :map}, default: [])
+      field(:status_field_name, :string, default: "Status")
+      field(:workpad_comment, StringOrMap)
       field(:assignee, :string)
       field(:active_states, {:array, :string}, default: ["Todo", "In Progress"])
       field(:terminal_states, {:array, :string}, default: ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"])
@@ -59,9 +63,34 @@ defmodule SymphonyElixir.Config.Schema do
       schema
       |> cast(
         attrs,
-        [:kind, :endpoint, :api_key, :project_slug, :assignee, :active_states, :terminal_states],
+        [
+          :kind,
+          :endpoint,
+          :api_key,
+          :project_slug,
+          :owner,
+          :projects,
+          :status_field_name,
+          :workpad_comment,
+          :assignee,
+          :active_states,
+          :terminal_states
+        ],
         empty_values: []
       )
+      |> maybe_apply_github_endpoint_default(attrs)
+    end
+
+    defp maybe_apply_github_endpoint_default(changeset, attrs) do
+      if get_field(changeset, :kind) == "github" and not endpoint_provided?(attrs) do
+        put_change(changeset, :endpoint, "https://api.github.com/graphql")
+      else
+        changeset
+      end
+    end
+
+    defp endpoint_provided?(attrs) when is_map(attrs) do
+      Map.has_key?(attrs, :endpoint) or Map.has_key?(attrs, "endpoint")
     end
   end
 
@@ -368,7 +397,8 @@ defmodule SymphonyElixir.Config.Schema do
   defp finalize_settings(settings) do
     tracker = %{
       settings.tracker
-      | api_key: resolve_secret_setting(settings.tracker.api_key, System.get_env("LINEAR_API_KEY")),
+      | endpoint: tracker_endpoint(settings.tracker),
+        api_key: tracker_api_key(settings.tracker),
         assignee: resolve_secret_setting(settings.tracker.assignee, System.get_env("LINEAR_ASSIGNEE"))
     }
 
@@ -384,6 +414,20 @@ defmodule SymphonyElixir.Config.Schema do
     }
 
     %{settings | tracker: tracker, workspace: workspace, codex: codex}
+  end
+
+  defp tracker_endpoint(%{kind: "github", endpoint: endpoint}) when is_binary(endpoint),
+    do: resolve_endpoint_setting(endpoint, "https://api.github.com/graphql")
+
+  defp tracker_endpoint(%{endpoint: endpoint}) when is_binary(endpoint),
+    do: resolve_endpoint_setting(endpoint, "https://api.linear.app/graphql")
+
+  defp tracker_api_key(%{kind: kind, api_key: api_key}) when kind in [nil, "linear"] do
+    resolve_secret_setting(api_key, System.get_env("LINEAR_API_KEY"))
+  end
+
+  defp tracker_api_key(%{api_key: api_key}) do
+    resolve_secret_setting(api_key, nil)
   end
 
   defp normalize_keys(value) when is_map(value) do
@@ -419,6 +463,19 @@ defmodule SymphonyElixir.Config.Schema do
     case resolve_env_value(value, fallback) do
       resolved when is_binary(resolved) -> normalize_secret_value(resolved)
       resolved -> resolved
+    end
+  end
+
+  defp resolve_endpoint_setting(value, default) when is_binary(value) do
+    case resolve_env_value(value, default) do
+      resolved when is_binary(resolved) ->
+        case String.trim(resolved) do
+          "" -> default
+          trimmed -> trimmed
+        end
+
+      _other ->
+        default
     end
   end
 

@@ -1,13 +1,21 @@
 defmodule SymphonyElixir.AgentRunner do
   @moduledoc """
-  Executes a single Linear issue in its workspace with Codex.
+  Executes a single tracker issue in its workspace with Codex.
   """
 
   require Logger
   alias SymphonyElixir.Codex.AppServer
-  alias SymphonyElixir.{Config, Linear.Issue, PromptBuilder, Tracker, Workspace}
+  alias SymphonyElixir.Config
+  alias SymphonyElixir.GitHub.Issue, as: GitHubIssue
+  alias SymphonyElixir.Linear.Issue
+  alias SymphonyElixir.PromptBuilder
+  alias SymphonyElixir.Tracker
+  alias SymphonyElixir.Workspace
 
   @type worker_host :: String.t() | nil
+
+  defguardp is_tracker_issue(issue)
+            when is_struct(issue, Issue) or is_struct(issue, GitHubIssue)
 
   @spec run(map(), pid() | nil, keyword()) :: :ok | no_return()
   def run(issue, codex_update_recipient \\ nil, opts \\ []) do
@@ -52,26 +60,37 @@ defmodule SymphonyElixir.AgentRunner do
     end
   end
 
-  defp send_codex_update(recipient, %Issue{id: issue_id}, message)
-       when is_binary(issue_id) and is_pid(recipient) do
-    send(recipient, {:codex_worker_update, issue_id, message})
-    :ok
+  defp send_codex_update(recipient, issue, message) when is_pid(recipient) do
+    case tracker_issue_id(issue) do
+      issue_id when is_binary(issue_id) ->
+        send(recipient, {:codex_worker_update, issue_id, message})
+        :ok
+
+      _ ->
+        :ok
+    end
   end
 
   defp send_codex_update(_recipient, _issue, _message), do: :ok
 
-  defp send_worker_runtime_info(recipient, %Issue{id: issue_id}, worker_host, workspace)
-       when is_binary(issue_id) and is_pid(recipient) and is_binary(workspace) do
-    send(
-      recipient,
-      {:worker_runtime_info, issue_id,
-       %{
-         worker_host: worker_host,
-         workspace_path: workspace
-       }}
-    )
+  defp send_worker_runtime_info(recipient, issue, worker_host, workspace)
+       when is_pid(recipient) and is_binary(workspace) do
+    case tracker_issue_id(issue) do
+      issue_id when is_binary(issue_id) ->
+        send(
+          recipient,
+          {:worker_runtime_info, issue_id,
+           %{
+             worker_host: worker_host,
+             workspace_path: workspace
+           }}
+        )
 
-    :ok
+        :ok
+
+      _ ->
+        :ok
+    end
   end
 
   defp send_worker_runtime_info(_recipient, _issue, _worker_host, _workspace), do: :ok
@@ -144,14 +163,20 @@ defmodule SymphonyElixir.AgentRunner do
     """
   end
 
-  defp continue_with_issue?(%Issue{id: issue_id} = issue, issue_state_fetcher) when is_binary(issue_id) do
+  defp continue_with_issue?(issue, issue_state_fetcher) when is_tracker_issue(issue) do
+    issue
+    |> tracker_issue_id()
+    |> continue_with_issue_id(issue, issue_state_fetcher)
+  end
+
+  defp continue_with_issue?(issue, _issue_state_fetcher), do: {:done, issue}
+
+  defp continue_with_issue_id(issue_id, issue, _issue_state_fetcher) when not is_binary(issue_id), do: {:done, issue}
+
+  defp continue_with_issue_id(issue_id, issue, issue_state_fetcher) do
     case issue_state_fetcher.([issue_id]) do
-      {:ok, [%Issue{} = refreshed_issue | _]} ->
-        if active_issue_state?(refreshed_issue.state) do
-          {:continue, refreshed_issue}
-        else
-          {:done, refreshed_issue}
-        end
+      {:ok, [refreshed_issue | _]} when is_tracker_issue(refreshed_issue) ->
+        continue_or_finish(refreshed_issue)
 
       {:ok, []} ->
         {:done, issue}
@@ -161,7 +186,13 @@ defmodule SymphonyElixir.AgentRunner do
     end
   end
 
-  defp continue_with_issue?(issue, _issue_state_fetcher), do: {:done, issue}
+  defp continue_or_finish(refreshed_issue) do
+    if active_issue_state?(refreshed_issue.state) do
+      {:continue, refreshed_issue}
+    else
+      {:done, refreshed_issue}
+    end
+  end
 
   defp active_issue_state?(state_name) when is_binary(state_name) do
     normalized_state = normalize_issue_state(state_name)
@@ -197,7 +228,10 @@ defmodule SymphonyElixir.AgentRunner do
     |> String.downcase()
   end
 
-  defp issue_context(%Issue{id: issue_id, identifier: identifier}) do
+  defp issue_context(%{id: issue_id, identifier: identifier} = issue) when is_tracker_issue(issue) do
     "issue_id=#{issue_id} issue_identifier=#{identifier}"
   end
+
+  defp tracker_issue_id(%{id: issue_id} = issue) when is_binary(issue_id) and is_tracker_issue(issue), do: issue_id
+  defp tracker_issue_id(_issue), do: nil
 end

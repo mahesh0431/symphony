@@ -13,7 +13,7 @@ This directory contains the current Elixir/OTP implementation of Symphony, based
 
 ## How it works
 
-1. Polls Linear for candidate work
+1. Polls Linear or configured GitHub Projects for candidate work
 2. Creates a workspace per issue
 3. Launches Codex in [App Server mode](https://developers.openai.com/codex/app-server/) inside the
    workspace
@@ -21,7 +21,11 @@ This directory contains the current Elixir/OTP implementation of Symphony, based
 5. Keeps Codex working on the issue until the work is done
 
 During app-server sessions, Symphony also serves a client-side `linear_graphql` tool so that repo
-skills can make raw Linear GraphQL calls.
+skills can make raw Linear GraphQL calls when Linear is the active tracker.
+
+In GitHub mode, Symphony polls the configured GitHub Projects via GraphQL, bootstraps workspaces
+from the repository metadata attached to each runnable issue, and keeps one persistent issue
+workpad comment instead of posting duplicate progress comments.
 
 If a claimed issue moves to a terminal state (`Done`, `Closed`, `Cancelled`, or `Duplicate`),
 Symphony stops the active agent for that issue and cleans up matching workspaces.
@@ -43,6 +47,48 @@ Symphony stops the active agent for that issue and cleans up matching workspaces
      issue statuses: "Rework", "Human Review", and "Merging". You can customize them in
      Team Settings → Workflow in Linear.
 6. Follow the instructions below to install the required runtime dependencies and start the service.
+
+### GitHub Projects v2 setup
+
+The current GitHub tracker implementation source of truth is
+[`../PLANS.md`](../PLANS.md). For a runnable GitHub example workflow, start from
+[`WORKFLOW.github.example.md`](./WORKFLOW.github.example.md).
+
+This GitHub setup is intentionally narrow in the current v1 contract:
+
+- the supported and tested owner model is user-owned GitHub Projects only
+- org-backed GitHub Projects are not supported or tested in this pass
+- the supported and tested workspace bootstrap path is HTTPS-based repository
+  bootstrap only
+- SSH clone/bootstrap is not supported or tested in this pass
+
+1. Create a personal access token that can read and update the target repository issues and
+   GitHub Project, then export it as `GITHUB_TOKEN`.
+2. Copy [`WORKFLOW.github.example.md`](./WORKFLOW.github.example.md) into your target repository as
+   `WORKFLOW.md`, then replace the owner login, project numbers, workspace root, and repository
+   bootstrap command with your own values.
+   - Keep `owner.type: user` in this follow-up. User-owned Projects are the only
+     supported and tested shape in this pass.
+   - Keep repository bootstrap HTTPS-based in this follow-up. Do not treat SSH
+     clone/bootstrap as supported just because other repo workflows may use SSH.
+3. Ensure each runnable GitHub issue is linked to the repository Symphony should clone. GitHub v1
+   intentionally fails with `{:github_issue_repository_missing, ...}` when a project item is not
+   repo-backed.
+4. Configure the GitHub Project workflow intentionally:
+   - Use `Backlog` as intake and `Todo` as the first runnable state.
+   - When GitHub allows it, scope `Item added to project` to `issue` only and route those items to `Backlog`.
+   - Keep `Human Review` non-runnable.
+   - Treat `Human Review -> Merging -> Done` as the approval and landing path.
+   - Disable the built-in `PR linked -> In Progress` workflow rule.
+   - It is fine to keep GitHub's default closed-issue movement to `Done`.
+5. Use merge-driven completion. Symphony expects the PR body to include a closing keyword such as
+   `Closes #123` so that the merged PR closes the issue and the issue item naturally lands in
+   `Done`.
+6. GitHub v1 stays GraphQL-only. It does not inject a GitHub-specific dynamic tool, and it does
+   not reuse `linear_graphql`.
+7. Keep the body of your GitHub `WORKFLOW.md` aligned with the main
+   [`WORKFLOW.md`](./WORKFLOW.md). In practice, only the tracker front matter and the GitHub
+   issue prompt header should differ.
 
 ## Prerequisites
 

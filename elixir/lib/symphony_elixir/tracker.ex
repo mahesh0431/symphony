@@ -1,6 +1,10 @@
 defmodule SymphonyElixir.Tracker do
   @moduledoc """
   Adapter boundary for issue tracker reads and writes.
+
+  The tracker boundary covers the minimal read/write lifecycle needed by the
+  orchestrator, including persistent workpad comment updates when supported by
+  the underlying tracker.
   """
 
   alias SymphonyElixir.Config
@@ -9,6 +13,7 @@ defmodule SymphonyElixir.Tracker do
   @callback fetch_issues_by_states([String.t()]) :: {:ok, [term()]} | {:error, term()}
   @callback fetch_issue_states_by_ids([String.t()]) :: {:ok, [term()]} | {:error, term()}
   @callback create_comment(String.t(), String.t()) :: :ok | {:error, term()}
+  @callback upsert_workpad_comment(String.t(), String.t()) :: :ok | {:error, term()}
   @callback update_issue_state(String.t(), String.t()) :: :ok | {:error, term()}
 
   @spec fetch_candidate_issues() :: {:ok, [term()]} | {:error, term()}
@@ -31,6 +36,11 @@ defmodule SymphonyElixir.Tracker do
     adapter().create_comment(issue_id, body)
   end
 
+  @spec upsert_workpad_comment(String.t(), String.t()) :: :ok | {:error, term()}
+  def upsert_workpad_comment(issue_id, body) do
+    adapter().upsert_workpad_comment(issue_id, body)
+  end
+
   @spec update_issue_state(String.t(), String.t()) :: :ok | {:error, term()}
   def update_issue_state(issue_id, state_name) do
     adapter().update_issue_state(issue_id, state_name)
@@ -40,6 +50,7 @@ defmodule SymphonyElixir.Tracker do
   def adapter do
     case Config.settings!().tracker.kind do
       "memory" -> SymphonyElixir.Tracker.Memory
+      "github" -> SymphonyElixir.GitHub.Adapter
       _ -> SymphonyElixir.Linear.Adapter
     end
   end

@@ -34,6 +34,21 @@ help with the setup:
 > Set up Symphony for my repository based on
 > https://github.com/openai/symphony/blob/main/elixir/README.md
 
+> [!NOTE]
+> The current GitHub Projects v2 implementation source of truth is
+> [PLANS.md](PLANS.md). For v1, keep the same repo-backed issue out of multiple
+> configured Symphony projects until duplicate-membership handling is implemented.
+
+> [!NOTE]
+> For GitHub Projects v2 setup, configure project workflows intentionally:
+> use `Backlog` as the intake state, not `Todo`, because items in `Todo` can be picked up by
+> Symphony on the next poll. When GitHub lets you scope `Item added to project`, make it
+> `issue`-only so PRs do not hit the intake rule. Disable any built-in workflow that moves
+> linked-PR issues to `In Progress`. Keep `Human Review` non-runnable, use `Merging` as the
+> approved-by-human handoff state, and let closed issues land in `Done`. If you enable
+> `when status changes to Done, close issue`, treat `Done` as a terminal state only and never
+> move items there early.
+
 ---
 
 ## License

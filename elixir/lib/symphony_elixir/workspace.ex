@@ -20,9 +20,15 @@ defmodule SymphonyElixir.Workspace do
 
       with {:ok, workspace} <- workspace_path_for_issue(safe_id, worker_host),
            :ok <- validate_workspace_path(workspace, worker_host),
-           {:ok, workspace, created?} <- ensure_workspace(workspace, worker_host),
-           :ok <- maybe_run_after_create_hook(workspace, issue_context, created?, worker_host) do
-        {:ok, workspace}
+           {:ok, workspace, created?} <- ensure_workspace(workspace, worker_host) do
+        with :ok <- maybe_bootstrap_workspace(workspace, issue_context, created?, worker_host),
+             :ok <- maybe_run_after_create_hook(workspace, issue_context, created?, worker_host) do
+          {:ok, workspace}
+        else
+          {:error, reason} = error ->
+            maybe_cleanup_failed_bootstrap(workspace, created?, worker_host, reason)
+            error
+        end
       end
     rescue
       error in [ArgumentError, ErlangError, File.Error] ->
@@ -223,6 +229,90 @@ defmodule SymphonyElixir.Workspace do
       false ->
         :ok
     end
+  end
+
+  defp maybe_bootstrap_workspace(_workspace, _issue_context, false, _worker_host), do: :ok
+
+  defp maybe_bootstrap_workspace(workspace, issue_context, true, worker_host) do
+    case Config.settings!().tracker.kind do
+      "github" ->
+        maybe_bootstrap_github_repository(workspace, issue_context, worker_host)
+
+      _ ->
+        :ok
+    end
+  end
+
+  defp maybe_bootstrap_github_repository(workspace, issue_context, nil) do
+    with {:ok, clone_source} <- github_clone_source(issue_context) do
+      case System.cmd("git", ["clone", "--depth", "1", clone_source, "."], cd: workspace, stderr_to_stdout: true) do
+        {_output, 0} ->
+          :ok
+
+        {output, status} ->
+          {:error, {:github_repository_clone_failed, status, output}}
+      end
+    end
+  end
+
+  defp maybe_bootstrap_github_repository(workspace, issue_context, worker_host) when is_binary(worker_host) do
+    with {:ok, clone_source} <- github_clone_source(issue_context) do
+      script =
+        [
+          remote_shell_assign("workspace", workspace),
+          "cd \"$workspace\"",
+          "git clone --depth 1 #{shell_escape(clone_source)} ."
+        ]
+        |> Enum.join("\n")
+
+      case run_remote_command(worker_host, script, Config.settings!().hooks.timeout_ms) do
+        {:ok, {_output, 0}} ->
+          :ok
+
+        {:ok, {output, status}} ->
+          {:error, {:github_repository_clone_failed, status, output}}
+
+        {:error, reason} ->
+          {:error, reason}
+      end
+    end
+  end
+
+  defp github_clone_source(issue_context) do
+    case issue_context.github_clone_url ||
+           issue_context.repository_url ||
+           issue_context.repository_ssh_url do
+      clone_source when is_binary(clone_source) and clone_source != "" ->
+        {:ok, clone_source}
+
+      _ ->
+        missing_identifier =
+          issue_context.project_item_id || issue_context.issue_id || issue_context.issue_identifier
+
+        {:error, {:github_issue_repository_missing, missing_identifier}}
+    end
+  end
+
+  defp maybe_cleanup_failed_bootstrap(_workspace, false, _worker_host, _reason), do: :ok
+
+  defp maybe_cleanup_failed_bootstrap(_workspace, _created?, _worker_host, {:workspace_hook_failed, _, _, _}), do: :ok
+  defp maybe_cleanup_failed_bootstrap(_workspace, _created?, _worker_host, {:workspace_hook_timeout, _, _}), do: :ok
+
+  defp maybe_cleanup_failed_bootstrap(workspace, true, nil, _reason) do
+    File.rm_rf(workspace)
+    :ok
+  end
+
+  defp maybe_cleanup_failed_bootstrap(workspace, true, worker_host, _reason) when is_binary(worker_host) do
+    script =
+      [
+        remote_shell_assign("workspace", workspace),
+        "rm -rf \"$workspace\""
+      ]
+      |> Enum.join("\n")
+
+    _ = run_remote_command(worker_host, script, Config.settings!().hooks.timeout_ms)
+    :ok
   end
 
   defp maybe_run_before_remove_hook(workspace, nil) do
@@ -456,25 +546,59 @@ defmodule SymphonyElixir.Workspace do
   defp worker_host_for_log(nil), do: "local"
   defp worker_host_for_log(worker_host), do: worker_host
 
-  defp issue_context(%{id: issue_id, identifier: identifier}) do
+  defp issue_context(%{id: issue_id, identifier: identifier} = issue) do
     %{
       issue_id: issue_id,
-      issue_identifier: identifier || "issue"
+      issue_identifier: identifier || "issue",
+      project_item_id: issue_context_value(issue, :project_item_id),
+      repository_name_with_owner: issue_context_value(issue, :repository_name_with_owner),
+      repository_url: issue_context_value(issue, :repository_url),
+      repository_ssh_url: issue_context_value(issue, :repository_ssh_url),
+      repository_default_branch: issue_context_value(issue, :repository_default_branch),
+      github_clone_url: issue_context_clone_url(issue)
     }
   end
 
   defp issue_context(identifier) when is_binary(identifier) do
     %{
       issue_id: nil,
-      issue_identifier: identifier
+      issue_identifier: identifier,
+      project_item_id: nil,
+      repository_name_with_owner: nil,
+      repository_url: nil,
+      repository_ssh_url: nil,
+      repository_default_branch: nil,
+      github_clone_url: nil
     }
   end
 
   defp issue_context(_identifier) do
     %{
       issue_id: nil,
-      issue_identifier: "issue"
+      issue_identifier: "issue",
+      project_item_id: nil,
+      repository_name_with_owner: nil,
+      repository_url: nil,
+      repository_ssh_url: nil,
+      repository_default_branch: nil,
+      github_clone_url: nil
     }
+  end
+
+  defp issue_context_value(issue, key) when is_map(issue) do
+    Map.get(issue, key) || Map.get(issue, to_string(key))
+  end
+
+  defp issue_context_clone_url(issue) when is_map(issue) do
+    issue
+    |> issue_context_value(:tracker_metadata)
+    |> case do
+      metadata when is_map(metadata) ->
+        Map.get(metadata, "clone_url") || Map.get(metadata, :clone_url)
+
+      _ ->
+        nil
+    end
   end
 
   defp issue_log_context(%{issue_id: issue_id, issue_identifier: issue_identifier}) do

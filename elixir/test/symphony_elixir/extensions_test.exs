@@ -4,6 +4,7 @@ defmodule SymphonyElixir.ExtensionsTest do
   import Phoenix.ConnTest
   import Phoenix.LiveViewTest
 
+  alias SymphonyElixir.GitHub.Adapter, as: GitHubAdapter
   alias SymphonyElixir.Linear.Adapter
   alias SymphonyElixir.Tracker.Memory
 
@@ -181,7 +182,7 @@ defmodule SymphonyElixir.ExtensionsTest do
     WorkflowStore.force_reload()
   end
 
-  test "tracker delegates to memory and linear adapters" do
+  test "tracker delegates to memory, linear, and github adapters" do
     issue = %Issue{id: "issue-1", identifier: "MT-1", state: "In Progress"}
     Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue, %{id: "ignored"}])
     Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
@@ -193,16 +194,36 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert {:ok, [^issue]} = SymphonyElixir.Tracker.fetch_issues_by_states([" in progress ", 42])
     assert {:ok, [^issue]} = SymphonyElixir.Tracker.fetch_issue_states_by_ids(["issue-1"])
     assert :ok = SymphonyElixir.Tracker.create_comment("issue-1", "comment")
+    assert :ok = SymphonyElixir.Tracker.upsert_workpad_comment("issue-1", "workpad")
     assert :ok = SymphonyElixir.Tracker.update_issue_state("issue-1", "Done")
     assert_receive {:memory_tracker_comment, "issue-1", "comment"}
+    assert_receive {:memory_tracker_comment, "issue-1", "workpad"}
     assert_receive {:memory_tracker_state_update, "issue-1", "Done"}
 
     Application.delete_env(:symphony_elixir, :memory_tracker_recipient)
     assert :ok = Memory.create_comment("issue-1", "quiet")
+    assert :ok = Memory.upsert_workpad_comment("issue-1", "quiet-workpad")
     assert :ok = Memory.update_issue_state("issue-1", "Quiet")
 
     write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "linear")
     assert SymphonyElixir.Tracker.adapter() == Adapter
+
+    write_raw_workflow!(
+      Workflow.workflow_file_path(),
+      """
+      ---
+      tracker:
+        kind: github
+        api_key: "gh-token"
+        owner: {login: "octo-org"}
+        projects: [{number: 1}]
+        status_field_name: "Status"
+      ---
+      You are an agent for this repository.
+      """
+    )
+
+    assert SymphonyElixir.Tracker.adapter() == GitHubAdapter
   end
 
   test "linear adapter delegates reads and validates mutation responses" do
@@ -243,6 +264,15 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     Process.put({FakeLinearClient, :graphql_result}, :unexpected)
     assert {:error, :comment_create_failed} = Adapter.create_comment("issue-1", "odd")
+
+    Process.put(
+      {FakeLinearClient, :graphql_result},
+      {:ok, %{"data" => %{"commentCreate" => %{"success" => true}}}}
+    )
+
+    assert :ok = Adapter.upsert_workpad_comment("issue-1", "workpad")
+    assert_receive {:graphql_called, upsert_query, %{body: "workpad", issueId: "issue-1"}}
+    assert upsert_query =~ "commentCreate"
 
     Process.put(
       {FakeLinearClient, :graphql_results},
@@ -317,6 +347,16 @@ defmodule SymphonyElixir.ExtensionsTest do
     )
 
     assert {:error, :issue_update_failed} = Adapter.update_issue_state("issue-1", "Odd")
+  end
+
+  defp write_raw_workflow!(path, contents) do
+    File.write!(path, contents)
+
+    if Process.whereis(SymphonyElixir.WorkflowStore) do
+      SymphonyElixir.WorkflowStore.force_reload()
+    end
+
+    :ok
   end
 
   test "phoenix observability api preserves state, issue, and refresh responses" do

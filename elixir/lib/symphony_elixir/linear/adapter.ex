@@ -58,6 +58,11 @@ defmodule SymphonyElixir.Linear.Adapter do
     end
   end
 
+  @spec upsert_workpad_comment(String.t(), String.t()) :: :ok | {:error, term()}
+  def upsert_workpad_comment(issue_id, body) when is_binary(issue_id) and is_binary(body) do
+    create_comment(issue_id, body)
+  end
+
   @spec update_issue_state(String.t(), String.t()) :: :ok | {:error, term()}
   def update_issue_state(issue_id, state_name)
       when is_binary(issue_id) and is_binary(state_name) do

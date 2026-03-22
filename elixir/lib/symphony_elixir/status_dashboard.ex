@@ -393,8 +393,23 @@ defmodule SymphonyElixir.StatusDashboard do
   end
 
   defp format_project_link_lines do
+    project_lines = tracker_project_lines(Config.settings!().tracker)
+
+    case dashboard_url() do
+      url when is_binary(url) ->
+        project_lines ++ [colorize("│ Dashboard: ", @ansi_bold) <> colorize(url, @ansi_cyan)]
+
+      _ ->
+        project_lines
+    end
+  end
+
+  defp tracker_project_lines(%{kind: "github"} = tracker), do: github_project_lines(tracker)
+  defp tracker_project_lines(%{"kind" => "github"} = tracker), do: github_project_lines(tracker)
+
+  defp tracker_project_lines(tracker) do
     project_part =
-      case Config.settings!().tracker.project_slug do
+      case tracker_project_slug(tracker) do
         project_slug when is_binary(project_slug) and project_slug != "" ->
           colorize(linear_project_url(project_slug), @ansi_cyan)
 
@@ -402,14 +417,24 @@ defmodule SymphonyElixir.StatusDashboard do
           colorize("n/a", @ansi_gray)
       end
 
-    project_line = colorize("│ Project: ", @ansi_bold) <> project_part
+    [colorize("│ Project: ", @ansi_bold) <> project_part]
+  end
 
-    case dashboard_url() do
-      url when is_binary(url) ->
-        [project_line, colorize("│ Dashboard: ", @ansi_bold) <> colorize(url, @ansi_cyan)]
+  defp github_project_lines(tracker) do
+    case github_project_urls(tracker) do
+      [] ->
+        [colorize("│ Projects: ", @ansi_bold) <> colorize("n/a", @ansi_gray)]
 
-      _ ->
-        [project_line]
+      [project_url] ->
+        [colorize("│ Project: ", @ansi_bold) <> colorize(project_url, @ansi_cyan)]
+
+      [first_url | remaining_urls] ->
+        [
+          colorize("│ Projects: ", @ansi_bold) <> colorize(first_url, @ansi_cyan)
+          | Enum.map(remaining_urls, fn project_url ->
+              "│           " <> colorize(project_url, @ansi_cyan)
+            end)
+        ]
     end
   end
 
@@ -427,7 +452,67 @@ defmodule SymphonyElixir.StatusDashboard do
     colorize("│ Next refresh: ", @ansi_bold) <> colorize("n/a", @ansi_gray)
   end
 
+  defp tracker_project_slug(tracker) when is_map(tracker) do
+    Map.get(tracker, :project_slug) || Map.get(tracker, "project_slug")
+  end
+
   defp linear_project_url(project_slug), do: "https://linear.app/project/#{project_slug}/issues"
+
+  defp github_project_urls(tracker) do
+    owner = Map.get(tracker, :owner) || Map.get(tracker, "owner")
+    owner_type = github_owner_type(owner)
+    owner_login = github_owner_login(owner)
+
+    tracker
+    |> github_projects()
+    |> Enum.map(&github_project_url(owner_type, owner_login, &1))
+    |> Enum.reject(&is_nil/1)
+  end
+
+  defp github_projects(tracker) when is_map(tracker) do
+    Map.get(tracker, :projects) || Map.get(tracker, "projects") || []
+  end
+
+  defp github_owner_type(owner) when is_map(owner) do
+    owner_type = Map.get(owner, :type) || Map.get(owner, "type")
+
+    case owner_type do
+      owner_type when owner_type in ["organization", "org"] -> "org"
+      owner_type when owner_type in ["user", "users"] -> "user"
+      _ -> nil
+    end
+  end
+
+  defp github_owner_type(_owner), do: nil
+
+  defp github_owner_login(owner) when is_map(owner) do
+    Map.get(owner, :login) || Map.get(owner, "login")
+  end
+
+  defp github_owner_login(_owner), do: nil
+
+  defp github_project_url(owner_type, owner_login, project)
+       when owner_type in ["org", "user"] and is_binary(owner_login) do
+    case github_project_number(project) do
+      project_number when is_integer(project_number) ->
+        "https://github.com/#{github_project_owner_segment(owner_type, owner_login)}/projects/#{project_number}"
+
+      _ ->
+        nil
+    end
+  end
+
+  defp github_project_url(_owner_type, _owner_login, _project), do: nil
+
+  defp github_project_number(%{number: number}) when is_integer(number), do: number
+  defp github_project_number(%{"number" => number}) when is_integer(number), do: number
+
+  defp github_project_number(%{number: number}) when is_binary(number), do: parse_integer(number)
+  defp github_project_number(%{"number" => number}) when is_binary(number), do: parse_integer(number)
+  defp github_project_number(_project), do: nil
+
+  defp github_project_owner_segment("org", owner_login), do: "orgs/#{owner_login}"
+  defp github_project_owner_segment("user", owner_login), do: "users/#{owner_login}"
 
   defp dashboard_url do
     dashboard_url(Config.settings!().server.host, Config.server_port(), HttpServer.bound_port())

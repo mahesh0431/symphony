@@ -20,6 +20,9 @@ defmodule SymphonyElixir.Config do
   {% endif %}
   """
 
+  @linear_graphql_endpoint "https://api.linear.app/graphql"
+  @supported_tracker_kinds ["linear", "memory", "github"]
+
   @type codex_runtime_settings :: %{
           approval_policy: String.t() | map(),
           thread_sandbox: String.t(),
@@ -119,19 +122,56 @@ defmodule SymphonyElixir.Config do
       is_nil(settings.tracker.kind) ->
         {:error, :missing_tracker_kind}
 
-      settings.tracker.kind not in ["linear", "memory"] ->
+      settings.tracker.kind not in @supported_tracker_kinds ->
         {:error, {:unsupported_tracker_kind, settings.tracker.kind}}
 
-      settings.tracker.kind == "linear" and not is_binary(settings.tracker.api_key) ->
-        {:error, :missing_linear_api_token}
+      true ->
+        validate_tracker_semantics(settings.tracker)
+    end
+  end
 
-      settings.tracker.kind == "linear" and not is_binary(settings.tracker.project_slug) ->
-        {:error, :missing_linear_project_slug}
+  defp validate_tracker_semantics(%{kind: "linear"} = tracker), do: validate_linear_tracker(tracker)
+  defp validate_tracker_semantics(%{kind: "github"} = tracker), do: validate_github_tracker(tracker)
+  defp validate_tracker_semantics(_tracker), do: :ok
+
+  defp validate_linear_tracker(tracker) do
+    cond do
+      not is_binary(tracker.api_key) -> {:error, :missing_linear_api_token}
+      not is_binary(tracker.project_slug) -> {:error, :missing_linear_project_slug}
+      true -> :ok
+    end
+  end
+
+  defp validate_github_tracker(tracker) do
+    cond do
+      tracker.endpoint == @linear_graphql_endpoint ->
+        {:error, :invalid_github_endpoint}
+
+      not is_binary(tracker.api_key) ->
+        {:error, :missing_github_api_token}
+
+      not present_string?(github_owner_login(tracker.owner)) ->
+        {:error, :missing_github_owner_login}
+
+      Enum.empty?(github_projects(tracker.projects)) ->
+        {:error, :missing_github_projects}
 
       true ->
         :ok
     end
   end
+
+  defp github_owner_login(owner) when is_map(owner) do
+    Map.get(owner, "login") || Map.get(owner, :login)
+  end
+
+  defp github_owner_login(_owner), do: nil
+
+  defp github_projects(projects) when is_list(projects), do: projects
+  defp github_projects(_projects), do: []
+
+  defp present_string?(value) when is_binary(value), do: String.trim(value) != ""
+  defp present_string?(_value), do: false
 
   defp format_config_error(reason) do
     case reason do

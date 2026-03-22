@@ -1,6 +1,8 @@
 defmodule SymphonyElixir.CoreTest do
   use SymphonyElixir.TestSupport
 
+  alias SymphonyElixir.GitHub.Issue, as: GitHubIssue
+
   test "config defaults and validation checks" do
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_api_token: nil,
@@ -133,6 +135,162 @@ defmodule SymphonyElixir.CoreTest do
     assert :ok = Config.validate!()
   end
 
+  test "memory config still validates without tracker credentials" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      tracker_endpoint: nil,
+      tracker_api_token: nil,
+      tracker_project_slug: nil,
+      codex_command: "/bin/sh app-server"
+    )
+
+    assert :ok = Config.validate!()
+    assert Config.settings!().tracker.kind == "memory"
+  end
+
+  test "github config defaults endpoint and preserves github-only tracker fields" do
+    write_raw_workflow!(
+      Workflow.workflow_file_path(),
+      """
+      ---
+      tracker:
+        kind: github
+        api_key: "gh-token"
+        owner: {login: "octo-org"}
+        projects: [{number: 1}, {number: 2}]
+        status_field_name: "Status"
+        workpad_comment: {heading: "## Codex Workpad", marker: "<!-- symphony:workpad -->"}
+      ---
+      You are an agent for this repository.
+      """
+    )
+
+    assert :ok = Config.validate!()
+
+    tracker = Config.settings!().tracker
+    assert tracker.endpoint == "https://api.github.com/graphql"
+    assert tracker.owner == %{"login" => "octo-org"}
+    assert tracker.projects == [%{"number" => 1}, %{"number" => 2}]
+    assert tracker.status_field_name == "Status"
+
+    assert tracker.workpad_comment == %{
+             "heading" => "## Codex Workpad",
+             "marker" => "<!-- symphony:workpad -->"
+           }
+  end
+
+  test "github config accepts a custom endpoint from workflow" do
+    write_raw_workflow!(
+      Workflow.workflow_file_path(),
+      """
+      ---
+      tracker:
+        kind: github
+        endpoint: "https://github.example.internal/api/graphql"
+        api_key: "gh-token"
+        owner: {login: "octo-org"}
+        projects: [{number: 1}]
+      ---
+      You are an agent for this repository.
+      """
+    )
+
+    assert :ok = Config.validate!()
+    assert Config.settings!().tracker.endpoint == "https://github.example.internal/api/graphql"
+  end
+
+  test "github config treats a blank endpoint as unset" do
+    write_raw_workflow!(
+      Workflow.workflow_file_path(),
+      """
+      ---
+      tracker:
+        kind: github
+        endpoint: ""
+        api_key: "gh-token"
+        owner: {login: "octo-org"}
+        projects: [{number: 1}]
+      ---
+      You are an agent for this repository.
+      """
+    )
+
+    assert :ok = Config.validate!()
+    assert Config.settings!().tracker.endpoint == "https://api.github.com/graphql"
+  end
+
+  test "github config requires an api token" do
+    write_raw_workflow!(
+      Workflow.workflow_file_path(),
+      """
+      ---
+      tracker:
+        kind: github
+        owner: {login: "octo-org"}
+        projects: [{number: 1}]
+      ---
+      You are an agent for this repository.
+      """
+    )
+
+    assert {:error, :missing_github_api_token} = Config.validate!()
+  end
+
+  test "github config requires an owner login" do
+    write_raw_workflow!(
+      Workflow.workflow_file_path(),
+      """
+      ---
+      tracker:
+        kind: github
+        api_key: "gh-token"
+        owner: {}
+        projects: [{number: 1}]
+      ---
+      You are an agent for this repository.
+      """
+    )
+
+    assert {:error, :missing_github_owner_login} = Config.validate!()
+  end
+
+  test "github config requires at least one tracked project" do
+    write_raw_workflow!(
+      Workflow.workflow_file_path(),
+      """
+      ---
+      tracker:
+        kind: github
+        api_key: "gh-token"
+        owner: {login: "octo-org"}
+        projects: []
+      ---
+      You are an agent for this repository.
+      """
+    )
+
+    assert {:error, :missing_github_projects} = Config.validate!()
+  end
+
+  test "github config rejects the linear endpoint" do
+    write_raw_workflow!(
+      Workflow.workflow_file_path(),
+      """
+      ---
+      tracker:
+        kind: github
+        endpoint: "https://api.linear.app/graphql"
+        api_key: "gh-token"
+        owner: {login: "octo-org"}
+        projects: [{number: 1}]
+      ---
+      You are an agent for this repository.
+      """
+    )
+
+    assert {:error, :invalid_github_endpoint} = Config.validate!()
+  end
+
   test "linear assignee resolves from LINEAR_ASSIGNEE env var" do
     previous_linear_assignee = System.get_env("LINEAR_ASSIGNEE")
     env_assignee = "dev@example.com"
@@ -222,6 +380,16 @@ defmodule SymphonyElixir.CoreTest do
 
   test "linear issue state reconciliation fetch with no running issues is a no-op" do
     assert {:ok, []} = Client.fetch_issue_states_by_ids([])
+  end
+
+  defp write_raw_workflow!(path, content) do
+    File.write!(path, content)
+
+    if Process.whereis(SymphonyElixir.WorkflowStore) do
+      SymphonyElixir.WorkflowStore.force_reload()
+    end
+
+    :ok
   end
 
   test "non-active issue state stops running agent without cleaning workspace" do
@@ -543,15 +711,15 @@ defmodule SymphonyElixir.CoreTest do
       |> Map.put(:retry_attempts, %{})
     end)
 
+    send_time_ms = System.monotonic_time(:millisecond)
     send(pid, {:DOWN, ref, :process, self(), :normal})
-    Process.sleep(50)
-    state = :sys.get_state(pid)
+    {state, %{attempt: 1, due_at_ms: due_at_ms}} = wait_for_retry_attempt!(pid, issue_id)
+    observed_time_ms = System.monotonic_time(:millisecond)
 
     refute Map.has_key?(state.running, issue_id)
     assert MapSet.member?(state.completed, issue_id)
-    assert %{attempt: 1, due_at_ms: due_at_ms} = state.retry_attempts[issue_id]
     assert is_integer(due_at_ms)
-    assert_due_in_range(due_at_ms, 500, 1_100)
+    assert_scheduled_delay_in_window(due_at_ms, send_time_ms, observed_time_ms, 1_000)
   end
 
   test "abnormal worker exit increments retry attempt progressively" do
@@ -584,14 +752,17 @@ defmodule SymphonyElixir.CoreTest do
       |> Map.put(:retry_attempts, %{})
     end)
 
+    send_time_ms = System.monotonic_time(:millisecond)
     send(pid, {:DOWN, ref, :process, self(), :boom})
-    Process.sleep(50)
-    state = :sys.get_state(pid)
 
-    assert %{attempt: 3, due_at_ms: due_at_ms, identifier: "MT-559", error: "agent exited: :boom"} =
-             state.retry_attempts[issue_id]
+    {state, %{attempt: 3, due_at_ms: due_at_ms, identifier: "MT-559", error: "agent exited: :boom"}} =
+      wait_for_retry_attempt!(pid, issue_id)
 
-    assert_due_in_range(due_at_ms, 39_500, 40_500)
+    observed_time_ms = System.monotonic_time(:millisecond)
+
+    refute Map.has_key?(state.running, issue_id)
+
+    assert_scheduled_delay_in_window(due_at_ms, send_time_ms, observed_time_ms, 40_000)
   end
 
   test "first abnormal worker exit waits before retrying" do
@@ -623,14 +794,17 @@ defmodule SymphonyElixir.CoreTest do
       |> Map.put(:retry_attempts, %{})
     end)
 
+    send_time_ms = System.monotonic_time(:millisecond)
     send(pid, {:DOWN, ref, :process, self(), :boom})
-    Process.sleep(50)
-    state = :sys.get_state(pid)
 
-    assert %{attempt: 1, due_at_ms: due_at_ms, identifier: "MT-560", error: "agent exited: :boom"} =
-             state.retry_attempts[issue_id]
+    {state, %{attempt: 1, due_at_ms: due_at_ms, identifier: "MT-560", error: "agent exited: :boom"}} =
+      wait_for_retry_attempt!(pid, issue_id)
 
-    assert_due_in_range(due_at_ms, 9_000, 10_500)
+    observed_time_ms = System.monotonic_time(:millisecond)
+
+    refute Map.has_key?(state.running, issue_id)
+
+    assert_scheduled_delay_in_window(due_at_ms, send_time_ms, observed_time_ms, 10_000)
   end
 
   test "stale retry timer messages do not consume newer retry entries" do
@@ -750,11 +924,28 @@ defmodule SymphonyElixir.CoreTest do
     assert Orchestrator.select_worker_host_for_test(state, "worker-a") == "worker-a"
   end
 
-  defp assert_due_in_range(due_at_ms, min_remaining_ms, max_remaining_ms) do
-    remaining_ms = due_at_ms - System.monotonic_time(:millisecond)
+  defp wait_for_retry_attempt!(pid, issue_id, attempts \\ 20)
 
-    assert remaining_ms >= min_remaining_ms
-    assert remaining_ms <= max_remaining_ms
+  defp wait_for_retry_attempt!(pid, issue_id, attempts) when attempts > 0 do
+    state = :sys.get_state(pid)
+
+    case state.retry_attempts[issue_id] do
+      nil ->
+        Process.sleep(25)
+        wait_for_retry_attempt!(pid, issue_id, attempts - 1)
+
+      retry ->
+        {state, retry}
+    end
+  end
+
+  defp wait_for_retry_attempt!(_pid, issue_id, 0) do
+    flunk("timed out waiting for retry scheduling for #{issue_id}")
+  end
+
+  defp assert_scheduled_delay_in_window(due_at_ms, earliest_ms, latest_ms, expected_delay_ms) do
+    assert due_at_ms >= earliest_ms + expected_delay_ms
+    assert due_at_ms <= latest_ms + expected_delay_ms
   end
 
   defp restore_app_env(key, nil), do: Application.delete_env(:symphony_elixir, key)
@@ -1160,6 +1351,177 @@ defmodule SymphonyElixir.CoreTest do
 
       assert session_id == "thread-live-turn-live"
     after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "agent runner supports github issues for runtime updates and continuation refresh" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-agent-runner-github-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      template_repo = Path.join(test_root, "source")
+      workspace_root = Path.join(test_root, "workspaces")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "codex.trace")
+
+      File.mkdir_p!(template_repo)
+      File.write!(Path.join(template_repo, "README.md"), "# test")
+      System.cmd("git", ["-C", template_repo, "init", "-b", "main"])
+      System.cmd("git", ["-C", template_repo, "config", "user.name", "Test User"])
+      System.cmd("git", ["-C", template_repo, "config", "user.email", "test@example.com"])
+      System.cmd("git", ["-C", template_repo, "add", "README.md"])
+      System.cmd("git", ["-C", template_repo, "commit", "-m", "initial"])
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      trace_file="${SYMP_TEST_CODEX_TRACE:-/tmp/codex.trace}"
+      count=0
+
+      while IFS= read -r line; do
+        count=$((count + 1))
+        printf 'JSON:%s\\n' "$line" >> "$trace_file"
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            ;;
+          3)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-gh"}}}'
+            ;;
+          4)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-gh-1"}}}'
+            printf '%s\\n' '{"method":"turn/completed"}'
+            ;;
+          5)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-gh-2"}}}'
+            printf '%s\\n' '{"method":"turn/completed"}'
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+      System.put_env("SYMP_TEST_CODEX_TRACE", trace_file)
+      on_exit(fn -> System.delete_env("SYMP_TEST_CODEX_TRACE") end)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "github",
+        tracker_endpoint: "https://api.github.com/graphql",
+        tracker_api_token: "gh-token",
+        tracker_project_slug: nil,
+        tracker_active_states: ["Todo", "In Progress", "Rework", "Merging"],
+        workspace_root: workspace_root,
+        hook_after_create: "cp #{Path.join(template_repo, "README.md")} README.md",
+        codex_command: "#{codex_binary} app-server",
+        max_turns: 3
+      )
+
+      parent = self()
+
+      state_fetcher = fn [_issue_id] ->
+        attempt = Process.get(:github_agent_turn_fetch_count, 0) + 1
+        Process.put(:github_agent_turn_fetch_count, attempt)
+        send(parent, {:github_issue_state_fetch, attempt})
+
+        state =
+          if attempt == 1 do
+            "Rework"
+          else
+            "Done"
+          end
+
+        {:ok,
+         [
+           %GitHubIssue{
+             id: "github-issue-continue",
+             identifier: "octo-org/example#7",
+             number: 7,
+             title: "Continue GitHub issue",
+             description: "Still active after the first turn",
+             state: state,
+             issue_state: "OPEN",
+             url: "https://github.com/octo-org/example/issues/7",
+             repository_name_with_owner: "octo-org/example",
+             repository_url: template_repo,
+             repository_ssh_url: nil,
+             repository_default_branch: "main",
+             project_id: "project-1",
+             project_number: 1,
+             project_title: "Project 1",
+             project_url: "https://github.com/users/octo-org/projects/1",
+             project_item_id: "item-1",
+             status_field_id: "field-1",
+             status_field_name: "Status"
+           }
+         ]}
+      end
+
+      issue = %GitHubIssue{
+        id: "github-issue-continue",
+        identifier: "octo-org/example#7",
+        number: 7,
+        title: "Continue GitHub issue",
+        description: "Still active after the first turn",
+        state: "Todo",
+        issue_state: "OPEN",
+        url: "https://github.com/octo-org/example/issues/7",
+        repository_name_with_owner: "octo-org/example",
+        repository_url: template_repo,
+        repository_ssh_url: nil,
+        repository_default_branch: "main",
+        project_id: "project-1",
+        project_number: 1,
+        project_title: "Project 1",
+        project_url: "https://github.com/users/octo-org/projects/1",
+        project_item_id: "item-1",
+        status_field_id: "field-1",
+        status_field_name: "Status"
+      }
+
+      assert :ok = AgentRunner.run(issue, parent, issue_state_fetcher: state_fetcher)
+
+      assert_receive {:worker_runtime_info, "github-issue-continue", %{workspace_path: workspace_path, worker_host: nil}},
+                     500
+
+      assert Path.basename(workspace_path) == "octo-org_example_7"
+      assert File.exists?(workspace_path)
+
+      assert_receive {:codex_worker_update, "github-issue-continue",
+                      %{
+                        event: :session_started,
+                        timestamp: %DateTime{},
+                        session_id: session_id
+                      }},
+                     500
+
+      assert session_id == "thread-gh-turn-gh-1"
+      assert_receive {:github_issue_state_fetch, 1}
+      assert_receive {:github_issue_state_fetch, 2}
+
+      turn_texts =
+        trace_file
+        |> File.read!()
+        |> String.split("\n", trim: true)
+        |> Enum.filter(&String.starts_with?(&1, "JSON:"))
+        |> Enum.map(&String.trim_leading(&1, "JSON:"))
+        |> Enum.map(&Jason.decode!/1)
+        |> Enum.filter(&(&1["method"] == "turn/start"))
+        |> Enum.map(fn payload ->
+          get_in(payload, ["params", "input"])
+          |> Enum.map_join("\n", &Map.get(&1, "text", ""))
+        end)
+
+      assert length(turn_texts) == 2
+      assert Enum.at(turn_texts, 0) =~ "You are an agent for this repository."
+      assert Enum.at(turn_texts, 1) =~ "Continuation guidance:"
+      assert Enum.at(turn_texts, 1) =~ "continuation turn #2 of 3"
+    after
+      System.delete_env("SYMP_TEST_CODEX_TRACE")
       File.rm_rf(test_root)
     end
   end

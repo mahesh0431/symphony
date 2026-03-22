@@ -987,6 +987,46 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     refute rendered =~ "Dashboard:"
   end
 
+  test "status dashboard renders github project links in header" do
+    write_raw_workflow!(
+      Workflow.workflow_file_path(),
+      """
+      ---
+      tracker:
+        kind: github
+        api_key: token
+        owner:
+          type: user
+          login: octocat
+        projects:
+          - number: 5
+          - number: 6
+      workspace:
+        root: #{Path.join(System.tmp_dir!(), "symphony_workspaces")}
+      codex:
+        command: codex app-server
+      ---
+
+      # GitHub Issue
+      """
+    )
+
+    snapshot_data =
+      {:ok,
+       %{
+         running: [],
+         retrying: [],
+         codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+         rate_limits: nil
+       }}
+
+    rendered = StatusDashboard.format_snapshot_content_for_test(snapshot_data, 0.0)
+
+    assert rendered =~ "https://github.com/users/octocat/projects/5"
+    assert rendered =~ "https://github.com/users/octocat/projects/6"
+    refute rendered =~ "https://linear.app/project/"
+  end
+
   test "status dashboard renders dashboard url on its own line when server port is configured" do
     previous_port_override = Application.get_env(:symphony_elixir, :server_port_override)
 
@@ -1600,5 +1640,15 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
       {next_tokens, [{timestamp, next_tokens} | acc]}
     end)
     |> elem(1)
+  end
+
+  defp write_raw_workflow!(path, content) do
+    File.write!(path, content)
+
+    if Process.whereis(SymphonyElixir.WorkflowStore) do
+      SymphonyElixir.WorkflowStore.force_reload()
+    end
+
+    :ok
   end
 end
