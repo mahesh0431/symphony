@@ -4,7 +4,7 @@ defmodule SymphonyElixir.Workspace do
   """
 
   require Logger
-  alias SymphonyElixir.{Config, PathSafety, SSH}
+  alias SymphonyElixir.{Config, PathSafety, SSH, Tracker}
 
   @remote_workspace_marker "__SYMPHONY_WORKSPACE__"
 
@@ -234,62 +234,46 @@ defmodule SymphonyElixir.Workspace do
   defp maybe_bootstrap_workspace(_workspace, _issue_context, false, _worker_host), do: :ok
 
   defp maybe_bootstrap_workspace(workspace, issue_context, true, worker_host) do
-    case Config.settings!().tracker.kind do
-      "github" ->
-        maybe_bootstrap_github_repository(workspace, issue_context, worker_host)
+    case Tracker.workspace_bootstrap_clone_source(issue_context) do
+      {:ok, clone_source} ->
+        bootstrap_workspace_repository(workspace, clone_source, worker_host)
 
-      _ ->
+      :skip ->
         :ok
+
+      {:error, _reason} = error ->
+        error
     end
   end
 
-  defp maybe_bootstrap_github_repository(workspace, issue_context, nil) do
-    with {:ok, clone_source} <- github_clone_source(issue_context) do
-      case System.cmd("git", ["clone", "--depth", "1", clone_source, "."], cd: workspace, stderr_to_stdout: true) do
-        {_output, 0} ->
-          :ok
+  defp bootstrap_workspace_repository(workspace, clone_source, nil) do
+    case System.cmd("git", ["clone", "--depth", "1", clone_source, "."], cd: workspace, stderr_to_stdout: true) do
+      {_output, 0} ->
+        :ok
 
-        {output, status} ->
-          {:error, {:github_repository_clone_failed, status, output}}
-      end
+      {output, status} ->
+        {:error, {:github_repository_clone_failed, status, output}}
     end
   end
 
-  defp maybe_bootstrap_github_repository(workspace, issue_context, worker_host) when is_binary(worker_host) do
-    with {:ok, clone_source} <- github_clone_source(issue_context) do
-      script =
-        [
-          remote_shell_assign("workspace", workspace),
-          "cd \"$workspace\"",
-          "git clone --depth 1 #{shell_escape(clone_source)} ."
-        ]
-        |> Enum.join("\n")
+  defp bootstrap_workspace_repository(workspace, clone_source, worker_host) when is_binary(worker_host) do
+    script =
+      [
+        remote_shell_assign("workspace", workspace),
+        "cd \"$workspace\"",
+        "git clone --depth 1 #{shell_escape(clone_source)} ."
+      ]
+      |> Enum.join("\n")
 
-      case run_remote_command(worker_host, script, Config.settings!().hooks.timeout_ms) do
-        {:ok, {_output, 0}} ->
-          :ok
+    case run_remote_command(worker_host, script, Config.settings!().hooks.timeout_ms) do
+      {:ok, {_output, 0}} ->
+        :ok
 
-        {:ok, {output, status}} ->
-          {:error, {:github_repository_clone_failed, status, output}}
+      {:ok, {output, status}} ->
+        {:error, {:github_repository_clone_failed, status, output}}
 
-        {:error, reason} ->
-          {:error, reason}
-      end
-    end
-  end
-
-  defp github_clone_source(issue_context) do
-    case issue_context.github_clone_url ||
-           issue_context.repository_url ||
-           issue_context.repository_ssh_url do
-      clone_source when is_binary(clone_source) and clone_source != "" ->
-        {:ok, clone_source}
-
-      _ ->
-        missing_identifier =
-          issue_context.project_item_id || issue_context.issue_id || issue_context.issue_identifier
-
-        {:error, {:github_issue_repository_missing, missing_identifier}}
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
@@ -547,6 +531,8 @@ defmodule SymphonyElixir.Workspace do
   defp worker_host_for_log(worker_host), do: worker_host
 
   defp issue_context(%{id: issue_id, identifier: identifier} = issue) do
+    tracker_metadata = issue_context_tracker_metadata(issue)
+
     %{
       issue_id: issue_id,
       issue_identifier: identifier || "issue",
@@ -555,7 +541,9 @@ defmodule SymphonyElixir.Workspace do
       repository_url: issue_context_value(issue, :repository_url),
       repository_ssh_url: issue_context_value(issue, :repository_ssh_url),
       repository_default_branch: issue_context_value(issue, :repository_default_branch),
-      github_clone_url: issue_context_clone_url(issue)
+      github_clone_url: issue_context_clone_url(tracker_metadata),
+      tracker_metadata: tracker_metadata,
+      tracker_kind: issue_context_tracker_kind(issue)
     }
   end
 
@@ -568,7 +556,9 @@ defmodule SymphonyElixir.Workspace do
       repository_url: nil,
       repository_ssh_url: nil,
       repository_default_branch: nil,
-      github_clone_url: nil
+      github_clone_url: nil,
+      tracker_metadata: nil,
+      tracker_kind: nil
     }
   end
 
@@ -581,7 +571,9 @@ defmodule SymphonyElixir.Workspace do
       repository_url: nil,
       repository_ssh_url: nil,
       repository_default_branch: nil,
-      github_clone_url: nil
+      github_clone_url: nil,
+      tracker_metadata: nil,
+      tracker_kind: nil
     }
   end
 
@@ -589,15 +581,23 @@ defmodule SymphonyElixir.Workspace do
     Map.get(issue, key) || Map.get(issue, to_string(key))
   end
 
-  defp issue_context_clone_url(issue) when is_map(issue) do
-    issue
-    |> issue_context_value(:tracker_metadata)
-    |> case do
-      metadata when is_map(metadata) ->
-        Map.get(metadata, "clone_url") || Map.get(metadata, :clone_url)
+  defp issue_context_tracker_metadata(issue) when is_map(issue) do
+    case issue_context_value(issue, :tracker_metadata) do
+      metadata when is_map(metadata) -> metadata
+      _ -> nil
+    end
+  end
 
-      _ ->
-        nil
+  defp issue_context_clone_url(tracker_metadata) when is_map(tracker_metadata) do
+    Map.get(tracker_metadata, "clone_url") || Map.get(tracker_metadata, :clone_url)
+  end
+
+  defp issue_context_clone_url(_tracker_metadata), do: nil
+
+  defp issue_context_tracker_kind(issue) when is_map(issue) do
+    case Tracker.resolve_issue_tracker_kind(issue) do
+      {:ok, tracker_kind} -> tracker_kind
+      {:error, _reason} -> nil
     end
   end
 

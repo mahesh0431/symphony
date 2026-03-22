@@ -77,7 +77,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
         repository_ssh_url: "git@github.com:octo-org/example.git",
         repository_default_branch: "main",
         project_item_id: "item-1",
-        tracker_metadata: %{"clone_url" => template_repo}
+        tracker_metadata: %{"kind" => "github", "clone_url" => template_repo}
       }
 
       assert {:ok, workspace} = Workspace.create_for_issue(issue)
@@ -151,6 +151,37 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
       assert {:error, {:github_issue_repository_missing, "item-404"}} =
                Workspace.create_for_issue(issue)
+    after
+      File.rm_rf(workspace_root)
+    end
+  end
+
+  test "workspace does not bootstrap repositories for memory tracker issues" do
+    workspace_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-workspace-memory-no-bootstrap-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        tracker_project_slug: nil,
+        workspace_root: workspace_root
+      )
+
+      issue = %{
+        id: "issue-memory",
+        identifier: "MEM-1",
+        title: "Memory issue",
+        repository_url: "https://github.com/octo-org/example",
+        repository_ssh_url: "git@github.com:octo-org/example.git",
+        tracker_metadata: %{"kind" => "memory"}
+      }
+
+      assert {:ok, workspace} = Workspace.create_for_issue(issue)
+      assert File.dir?(workspace)
+      assert {:ok, []} = File.ls(workspace)
     after
       File.rm_rf(workspace_root)
     end
@@ -1430,7 +1461,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     refute prompt =~ "Linear issue"
   end
 
-  test "prompt builder infers github tracker kind from plain issue maps" do
+  test "prompt builder uses explicit github tracker kind from plain issue maps" do
     workflow_prompt = "Kind {{ tracker.kind }} Repo {{ repository.name_with_owner }} Title {{ issue.title }}"
 
     write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory", prompt: workflow_prompt)
@@ -1438,13 +1469,30 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     prompt =
       PromptBuilder.build_prompt(%{
         "title" => "Map-backed issue",
-        "repository_name_with_owner" => "octo-org/example"
+        "repository_name_with_owner" => "octo-org/example",
+        "tracker_metadata" => %{"kind" => "github"}
       })
 
     assert prompt == "Kind github Repo octo-org/example Title Map-backed issue"
   end
 
-  test "prompt builder falls back to workflow tracker kind for plain issue maps without repo metadata" do
+  test "prompt builder does not fall back to workflow tracker kind when normalized plain issue maps omit tracker metadata" do
+    workflow_prompt = "Kind {{ tracker.kind }} Repo {{ repository.name_with_owner }} Title {{ issue.title }}"
+
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory", prompt: workflow_prompt)
+
+    prompt =
+      PromptBuilder.build_prompt(%{
+        "title" => "Map-backed issue missing tracker metadata",
+        "repository_name_with_owner" => "octo-org/example",
+        "repository_url" => "https://github.com/octo-org/example",
+        "project_item_id" => "item-7"
+      })
+
+    assert prompt == "Kind  Repo octo-org/example Title Map-backed issue missing tracker metadata"
+  end
+
+  test "prompt builder uses workflow tracker kind when plain issue maps have no normalized issue context" do
     workflow_prompt = "Kind {{ tracker.kind }} Title {{ issue.title }}"
 
     write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory", prompt: workflow_prompt)
@@ -1455,6 +1503,47 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       })
 
     assert prompt == "Kind memory Title Memory issue"
+  end
+
+  test "prompt builder honors explicit linear tracker kind for plain issue maps" do
+    workflow_prompt = "Kind {{ tracker.kind }} Title {{ issue.title }}"
+
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "github", prompt: workflow_prompt)
+
+    prompt =
+      PromptBuilder.build_prompt(%{
+        "title" => "Linear map issue",
+        "tracker_metadata" => %{"kind" => "linear"}
+      })
+
+    assert prompt == "Kind linear Title Linear map issue"
+  end
+
+  test "prompt builder does not fall back to workflow tracker kind when normalized tracker metadata kind is invalid" do
+    workflow_prompt = "Kind {{ tracker.kind }} Title {{ issue.title }}"
+
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "linear", prompt: workflow_prompt)
+
+    prompt =
+      PromptBuilder.build_prompt(%{
+        "title" => "Invalid tracker metadata issue",
+        "tracker_metadata" => %{"kind" => "not-a-supported-kind"}
+      })
+
+    assert prompt == "Kind  Title Invalid tracker metadata issue"
+  end
+
+  test "prompt builder omits workflow tracker kind when workflow tracker kind is invalid" do
+    workflow_prompt = "Kind {{ tracker.kind }} Title {{ issue.title }}"
+
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "not-a-supported-kind", prompt: workflow_prompt)
+
+    prompt =
+      PromptBuilder.build_prompt(%{
+        "title" => "Invalid workflow tracker kind"
+      })
+
+    assert prompt == "Kind  Title Invalid workflow tracker kind"
   end
 
   test "remote workspace lifecycle uses ssh host aliases from worker config" do

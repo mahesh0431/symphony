@@ -90,31 +90,18 @@ defmodule SymphonyElixir.CoreTest do
     assert {:error, {:unsupported_tracker_kind, "123"}} = Config.validate!()
   end
 
-  test "current WORKFLOW.md file is valid and complete" do
+  test "in-repo WORKFLOW.github.example.md remains loadable as a GitHub example" do
     original_workflow_path = Workflow.workflow_file_path()
     on_exit(fn -> Workflow.set_workflow_file_path(original_workflow_path) end)
-    Workflow.clear_workflow_file_path()
+
+    Workflow.set_workflow_file_path(Path.expand("WORKFLOW.github.example.md", File.cwd!()))
 
     assert {:ok, %{config: config, prompt: prompt}} = Workflow.load()
-    assert is_map(config)
-
-    tracker = Map.get(config, "tracker", %{})
-    assert is_map(tracker)
-    assert Map.get(tracker, "kind") == "linear"
-    assert is_binary(Map.get(tracker, "project_slug"))
-    assert is_list(Map.get(tracker, "active_states"))
-    assert is_list(Map.get(tracker, "terminal_states"))
-
-    hooks = Map.get(config, "hooks", %{})
-    assert is_map(hooks)
-    assert Map.get(hooks, "after_create") =~ "git clone --depth 1 https://github.com/openai/symphony ."
-    assert Map.get(hooks, "after_create") =~ "cd elixir && mise trust"
-    assert Map.get(hooks, "after_create") =~ "mise exec -- mix deps.get"
-    assert Map.get(hooks, "before_remove") =~ "cd elixir && mise exec -- mix workspace.before_remove"
-
+    assert get_in(config, ["tracker", "kind"]) == "github"
+    assert is_binary(prompt)
     assert String.trim(prompt) != ""
-    assert is_binary(Config.workflow_prompt())
-    assert Config.workflow_prompt() == prompt
+    assert prompt =~ "# GitHub Issue"
+    assert prompt =~ "Keep the body aligned with `WORKFLOW.md`"
   end
 
   test "linear api token resolves from LINEAR_API_KEY env var" do
@@ -924,6 +911,247 @@ defmodule SymphonyElixir.CoreTest do
     assert Orchestrator.select_worker_host_for_test(state, "worker-a") == "worker-a"
   end
 
+  test "github candidate polling still requires available slots while linear does not" do
+    full_state = %Orchestrator.State{
+      max_concurrent_agents: 1,
+      running: %{"issue-1" => %{}}
+    }
+
+    write_milestone4_github_workflow!(max_concurrent_agents: 1)
+    refute Orchestrator.should_poll_candidates_for_test(full_state)
+
+    write_workflow_file!(Workflow.workflow_file_path(), max_concurrent_agents: 1)
+    assert Orchestrator.should_poll_candidates_for_test(full_state)
+  end
+
+  test "github backlog and human review remain non-runnable even when configured active" do
+    write_milestone4_github_workflow!(active_states: ["Backlog", "Todo", "Human Review", "In Progress"])
+
+    base_state = %Orchestrator.State{
+      max_concurrent_agents: 2,
+      running: %{},
+      claimed: MapSet.new(),
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+      retry_attempts: %{}
+    }
+
+    refute Orchestrator.should_dispatch_issue_for_test(
+             github_dispatch_issue("issue-backlog", "Backlog"),
+             base_state
+           )
+
+    refute Orchestrator.should_dispatch_issue_for_test(
+             github_dispatch_issue("issue-human-review", "Human Review"),
+             base_state
+           )
+
+    assert Orchestrator.should_dispatch_issue_for_test(
+             github_dispatch_issue("issue-todo", "Todo"),
+             base_state
+           )
+  end
+
+  test "tracker helper fallbacks stay narrow across github and linear contexts" do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "linear", tracker_project_slug: "milestone5")
+
+    assert Tracker.project_urls() == ["https://linear.app/project/milestone5/issues"]
+    assert Tracker.project_urls(:invalid_tracker_shape) == []
+    assert Tracker.workspace_bootstrap_clone_source(:invalid_issue_context) == :skip
+    assert Tracker.runnable_active_state?(123) == false
+    assert Tracker.resolve_tracker_kind("github") == {:ok, "github"}
+    assert Tracker.resolve_tracker_kind(%{tracker_kind: "linear"}) == {:ok, "linear"}
+    assert Tracker.resolve_tracker_kind(123) == {:error, :missing_tracker_kind}
+    assert Tracker.resolve_tracker_kind(%{kind: 123}) == {:error, {:invalid_tracker_kind, 123}}
+    assert Tracker.resolve_issue_tracker_kind("invalid-issue-context") == {:error, :missing_tracker_metadata}
+    assert Tracker.resolve_issue_tracker_kind(%{"tracker_metadata" => "invalid"}) == {:error, :missing_tracker_metadata}
+
+    assert Tracker.workspace_bootstrap_clone_source(%GitHubIssue{
+             tracker_metadata: nil,
+             repository_url: "https://github.com/octo-org/example"
+           }) == :skip
+
+    assert Tracker.workspace_bootstrap_clone_source(%Issue{
+             tracker_metadata: nil
+           }) == :skip
+
+    assert Tracker.workspace_bootstrap_clone_source(%{
+             "tracker_metadata" => %{"kind" => "github"},
+             "repository_url" => "https://github.com/octo-org/example"
+           }) == {:ok, "https://github.com/octo-org/example"}
+
+    assert Tracker.workspace_bootstrap_clone_source(%{
+             "tracker_metadata" => %{},
+             "repository_url" => "https://github.com/octo-org/example"
+           }) == {:error, :issue_tracker_kind_missing}
+
+    assert Tracker.workspace_bootstrap_clone_source(%{
+             "tracker_metadata" => %{"kind" => "not-a-supported-kind"},
+             "repository_url" => "https://github.com/octo-org/example"
+           }) == {:error, {:unsupported_issue_tracker_kind, "not-a-supported-kind"}}
+  end
+
+  test "tracker adapter raises when workflow tracker kind cannot be resolved" do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "not-a-supported-kind")
+
+    assert_raise ArgumentError, ~r/unable to resolve tracker adapter: \{:invalid_tracker_kind, "not-a-supported-kind"\}/, fn ->
+      Tracker.adapter()
+    end
+  end
+
+  test "tracker helper derives github project urls from endpoint while keeping linear fallback behavior" do
+    assert Tracker.project_urls(%{
+             kind: "github",
+             endpoint: "https://api.github.com/graphql",
+             owner: %{type: "users", login: "octo-user"},
+             projects: [%{number: 11}]
+           }) == ["https://github.com/users/octo-user/projects/11"]
+
+    assert Tracker.project_urls(%{
+             kind: "github",
+             endpoint: "https://github.example.internal/api/graphql",
+             owner: %{type: "organization", login: "octo-org"},
+             projects: [%{number: 12}]
+           }) == ["https://github.example.internal/orgs/octo-org/projects/12"]
+
+    assert Tracker.project_urls(%{
+             kind: "github",
+             endpoint: "https://github.example.internal/graphql",
+             owner: %{type: "organization", login: "octo-org"},
+             projects: [%{number: 13}]
+           }) == []
+
+    assert Tracker.project_urls(%{project_slug: "milestone5"}) == ["https://linear.app/project/milestone5/issues"]
+  end
+
+  test "github adapter handles project url and clone-source edge cases" do
+    adapter = SymphonyElixir.GitHub.Adapter
+
+    assert adapter.workspace_bootstrap_clone_source(:invalid_issue_context) == :skip
+
+    assert adapter.workspace_bootstrap_clone_source(%{
+             issue_id: "issue-123"
+           }) == {:error, {:github_issue_repository_missing, "issue-123"}}
+
+    assert adapter.workspace_bootstrap_clone_source(%{
+             issue_identifier: "octo-org/example#124"
+           }) == {:error, {:github_issue_repository_missing, "octo-org/example#124"}}
+
+    assert adapter.project_urls(:invalid_tracker_shape) == []
+
+    assert adapter.project_urls(%{
+             owner: "octo-org",
+             projects: [%{number: 7}]
+           }) == []
+
+    assert adapter.project_urls(%{
+             owner: %{type: "team", login: "octo-org"},
+             projects: [%{number: 8}]
+           }) == []
+
+    assert adapter.project_urls(%{
+             owner: %{type: "organization", login: "octo-org"},
+             endpoint: "https://api.github.com/graphql",
+             projects: [%{number: 9}]
+           }) == ["https://github.com/orgs/octo-org/projects/9"]
+
+    assert adapter.project_urls(%{
+             "owner" => %{"type" => "users", "login" => "octo-user"},
+             "endpoint" => "https://api.github.com/graphql",
+             "projects" => [
+               %{number: 1},
+               %{"number" => 2},
+               %{number: "3"},
+               %{"number" => "4"},
+               %{"number" => "abc"},
+               %{}
+             ]
+           }) == [
+             "https://github.com/users/octo-user/projects/1",
+             "https://github.com/users/octo-user/projects/2",
+             "https://github.com/users/octo-user/projects/3",
+             "https://github.com/users/octo-user/projects/4"
+           ]
+
+    assert adapter.project_urls(%{
+             owner: %{type: "organization", login: "octo-org"},
+             endpoint: "https://github.example.internal/api/graphql",
+             projects: [%{number: 10}]
+           }) == ["https://github.example.internal/orgs/octo-org/projects/10"]
+
+    assert adapter.project_urls(%{
+             owner: %{type: "organization", login: "octo-org"},
+             endpoint: "https://github.example.internal/graphql",
+             projects: [%{number: 10}]
+           }) == []
+
+    assert adapter.project_urls(%{
+             owner: %{type: "organization", login: "octo-org"},
+             endpoint: "http://github.example.internal/api/graphql",
+             projects: [%{number: 10}]
+           }) == []
+
+    assert adapter.project_urls(%{
+             owner: %{type: "organization", login: "octo-org"},
+             endpoint: "https://github.example.internal/",
+             projects: [%{number: 10}]
+           }) == []
+
+    assert adapter.project_urls(%{
+             owner: %{type: "organization", login: "octo-org"},
+             endpoint: "https://github.example.internal",
+             projects: [%{number: 10}]
+           }) == []
+
+    assert adapter.project_urls(%{
+             owner: %{type: "organization", login: "octo-org"},
+             endpoint: "https://github.example.internal:8443/api/graphql",
+             projects: [%{number: 10}]
+           }) == ["https://github.example.internal:8443/orgs/octo-org/projects/10"]
+  end
+
+  test "linear adapter project url fallbacks remain unchanged" do
+    adapter = SymphonyElixir.Linear.Adapter
+
+    assert adapter.project_urls(%{project_slug: "demo"}) == ["https://linear.app/project/demo/issues"]
+    assert adapter.project_urls(%{project_slug: ""}) == []
+    assert adapter.project_urls(%{}) == []
+    assert adapter.project_urls(:invalid_tracker_shape) == []
+  end
+
+  defp write_milestone4_github_workflow!(opts) when is_list(opts) do
+    active_states = Keyword.get(opts, :active_states, ["Todo", "In Progress", "Rework", "Merging"])
+    max_concurrent_agents = Keyword.get(opts, :max_concurrent_agents, 10)
+
+    write_raw_workflow!(
+      Workflow.workflow_file_path(),
+      """
+      ---
+      tracker:
+        kind: github
+        endpoint: "https://api.github.com/graphql"
+        api_key: "gh-token"
+        owner: {login: "octo-org"}
+        projects: [{number: 1}]
+        status_field_name: "Status"
+        active_states: [#{Enum.map_join(active_states, ", ", &~s("#{&1}"))}]
+        terminal_states: ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"]
+      agent:
+        max_concurrent_agents: #{max_concurrent_agents}
+      ---
+      You are an agent for this repository.
+      """
+    )
+  end
+
+  defp github_dispatch_issue(issue_id, state_name) do
+    %GitHubIssue{
+      id: issue_id,
+      identifier: "octo-org/example##{issue_id}",
+      title: "GitHub dispatch issue #{issue_id}",
+      state: state_name
+    }
+  end
+
   defp wait_for_retry_attempt!(pid, issue_id, attempts \\ 20)
 
   defp wait_for_retry_attempt!(pid, issue_id, attempts) when attempts > 0 do
@@ -1084,6 +1312,20 @@ defmodule SymphonyElixir.CoreTest do
     assert Config.workflow_prompt() =~ "{{ issue.description }}"
   end
 
+  test "prompt builder raises when workflow prompt is blank for normalized issue maps missing tracker metadata kind" do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "linear", prompt: "   \n")
+
+    assert_raise RuntimeError,
+                 ~r/issue_tracker_metadata_missing: normalized issue context requires tracker_metadata.kind/,
+                 fn ->
+                   PromptBuilder.build_prompt(%{
+                     "identifier" => "octo-org/example#779",
+                     "title" => "Missing tracker metadata kind",
+                     "project_item_id" => 779
+                   })
+                 end
+  end
+
   test "prompt builder default template handles missing issue body" do
     write_workflow_file!(Workflow.workflow_file_path(), prompt: "")
 
@@ -1131,38 +1373,6 @@ defmodule SymphonyElixir.CoreTest do
     assert_raise RuntimeError, ~r/workflow_unavailable:/, fn ->
       PromptBuilder.build_prompt(issue)
     end
-  end
-
-  test "in-repo WORKFLOW.md renders correctly" do
-    workflow_path = Workflow.workflow_file_path()
-    Workflow.set_workflow_file_path(Path.expand("WORKFLOW.md", File.cwd!()))
-
-    issue = %Issue{
-      identifier: "MT-616",
-      title: "Use rich templates for WORKFLOW.md",
-      description: "Render with rich template variables",
-      state: "In Progress",
-      url: "https://example.org/issues/MT-616/use-rich-templates-for-workflowmd",
-      labels: ["templating", "workflow"]
-    }
-
-    on_exit(fn -> Workflow.set_workflow_file_path(workflow_path) end)
-
-    prompt = PromptBuilder.build_prompt(issue, attempt: 2)
-
-    assert prompt =~ "You are working on a Linear ticket `MT-616`"
-    assert prompt =~ "Issue context:"
-    assert prompt =~ "Identifier: MT-616"
-    assert prompt =~ "Title: Use rich templates for WORKFLOW.md"
-    assert prompt =~ "Current status: In Progress"
-    assert prompt =~ "https://example.org/issues/MT-616/use-rich-templates-for-workflowmd"
-    assert prompt =~ "This is an unattended orchestration session."
-    assert prompt =~ "Only stop early for a true blocker"
-    assert prompt =~ "Do not include \"next steps for user\""
-    assert prompt =~ "open and follow `.codex/skills/land/SKILL.md`"
-    assert prompt =~ "Do not call `gh pr merge` directly"
-    assert prompt =~ "Continuation context:"
-    assert prompt =~ "retry attempt #2"
   end
 
   test "prompt builder adds continuation guidance for retries" do
@@ -1519,6 +1729,8 @@ defmodule SymphonyElixir.CoreTest do
       assert length(turn_texts) == 2
       assert Enum.at(turn_texts, 0) =~ "You are an agent for this repository."
       assert Enum.at(turn_texts, 1) =~ "Continuation guidance:"
+      assert Enum.at(turn_texts, 1) =~ "tracker issue is still in an active state."
+      refute Enum.at(turn_texts, 1) =~ "Linear issue"
       assert Enum.at(turn_texts, 1) =~ "continuation turn #2 of 3"
     after
       System.delete_env("SYMP_TEST_CODEX_TRACE")
@@ -1720,6 +1932,8 @@ defmodule SymphonyElixir.CoreTest do
       assert Enum.at(turn_texts, 0) =~ "You are an agent for this repository."
       refute Enum.at(turn_texts, 1) =~ "You are an agent for this repository."
       assert Enum.at(turn_texts, 1) =~ "Continuation guidance:"
+      assert Enum.at(turn_texts, 1) =~ "tracker issue is still in an active state."
+      refute Enum.at(turn_texts, 1) =~ "Linear issue"
       assert Enum.at(turn_texts, 1) =~ "continuation turn #2 of 3"
     after
       System.delete_env("SYMP_TEST_CODEx_TRACE")

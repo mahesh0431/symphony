@@ -987,6 +987,27 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     refute rendered =~ "Dashboard:"
   end
 
+  test "status dashboard keeps memory project-link rendering unchanged" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      tracker_project_slug: "project"
+    )
+
+    snapshot_data =
+      {:ok,
+       %{
+         running: [],
+         retrying: [],
+         codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+         rate_limits: nil
+       }}
+
+    rendered = StatusDashboard.format_snapshot_content_for_test(snapshot_data, 0.0)
+
+    assert rendered =~ "https://linear.app/project/project/issues"
+    refute rendered =~ "https://github.com/"
+  end
+
   test "status dashboard renders github project links in header" do
     write_raw_workflow!(
       Workflow.workflow_file_path(),
@@ -1025,6 +1046,45 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert rendered =~ "https://github.com/users/octocat/projects/5"
     assert rendered =~ "https://github.com/users/octocat/projects/6"
     refute rendered =~ "https://linear.app/project/"
+  end
+
+  test "status dashboard derives github project links from custom endpoint" do
+    write_raw_workflow!(
+      Workflow.workflow_file_path(),
+      """
+      ---
+      tracker:
+        kind: github
+        endpoint: "https://github.example.internal/api/graphql"
+        api_key: token
+        owner:
+          type: organization
+          login: octo-org
+        projects:
+          - number: 15
+      workspace:
+        root: #{Path.join(System.tmp_dir!(), "symphony_workspaces")}
+      codex:
+        command: codex app-server
+      ---
+
+      # GitHub Issue
+      """
+    )
+
+    snapshot_data =
+      {:ok,
+       %{
+         running: [],
+         retrying: [],
+         codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+         rate_limits: nil
+       }}
+
+    rendered = StatusDashboard.format_snapshot_content_for_test(snapshot_data, 0.0)
+
+    assert rendered =~ "https://github.example.internal/orgs/octo-org/projects/15"
+    refute rendered =~ "https://github.com/orgs/octo-org/projects/15"
   end
 
   test "status dashboard renders dashboard url on its own line when server port is configured" do
@@ -1583,6 +1643,10 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
   end
 
   test "application stop renders offline status" do
+    on_exit(fn ->
+      assert {:ok, _started} = Application.ensure_all_started(:symphony_elixir)
+    end)
+
     rendered =
       ExUnit.CaptureIO.capture_io(fn ->
         assert :ok = SymphonyElixir.Application.stop(:normal)

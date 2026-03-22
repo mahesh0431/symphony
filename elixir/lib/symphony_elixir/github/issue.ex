@@ -28,6 +28,7 @@ defmodule SymphonyElixir.GitHub.Issue do
     :project_item_id,
     :status_field_id,
     :status_field_name,
+    tracker_metadata: %{"kind" => "github"},
     blocked_by: [],
     labels: [],
     assigned_to_worker: true,
@@ -52,6 +53,10 @@ defmodule SymphonyElixir.GitHub.Issue do
           number: integer() | nil,
           state: String.t() | nil,
           state_reason: String.t() | nil
+        }
+
+  @type tracker_metadata :: %{
+          optional(atom() | String.t()) => String.t() | nil
         }
 
   @type t :: %__MODULE__{
@@ -79,6 +84,7 @@ defmodule SymphonyElixir.GitHub.Issue do
           project_item_id: String.t() | nil,
           status_field_id: String.t() | nil,
           status_field_name: String.t() | nil,
+          tracker_metadata: tracker_metadata() | nil,
           blocked_by: [blocker()],
           labels: [String.t()],
           assigned_to_worker: boolean(),

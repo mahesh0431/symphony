@@ -677,7 +677,7 @@ defmodule SymphonyElixir.Orchestrator do
     normalized_state = normalize_issue_state(state_name)
 
     MapSet.member?(active_states, normalized_state) and
-      !(github_tracker_mode?() and non_runnable_github_state?(normalized_state))
+      Tracker.runnable_active_state?(normalized_state)
   end
 
   defp normalize_issue_state(state_name) when is_binary(state_name) do
@@ -709,10 +709,6 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp blocker_value(blocker, key) do
     Map.get(blocker, key) || Map.get(blocker, Atom.to_string(key))
-  end
-
-  defp non_runnable_github_state?(state_name) when is_binary(state_name) do
-    state_name in ["backlog", "human review"]
   end
 
   defp terminal_state_set do
@@ -1386,7 +1382,7 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp should_poll_candidates?(%State{} = state) do
-    !github_tracker_mode?() or available_slots(state) > 0
+    !Tracker.candidate_poll_requires_available_slots?() or available_slots(state) > 0
   end
 
   defp github_tracker_mode? do

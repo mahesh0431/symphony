@@ -3,10 +3,22 @@ defmodule SymphonyElixir.PromptBuilder do
   Builds agent prompts from tracker issue data.
   """
 
-  alias SymphonyElixir.{Config, Workflow}
+  alias SymphonyElixir.{Config, Tracker, Workflow}
 
   @render_opts [strict_variables: true, strict_filters: true]
-
+  @normalized_issue_context_fields [
+    :repository_name_with_owner,
+    :repository_url,
+    :repository_ssh_url,
+    :repository_default_branch,
+    :project_item_id,
+    :project_id,
+    :project_number,
+    :project_title,
+    :project_url,
+    :status_field_id,
+    :status_field_name
+  ]
   @default_github_prompt """
   # GitHub Issue
 
@@ -101,15 +113,23 @@ defmodule SymphonyElixir.PromptBuilder do
     }
   end
 
-  defp tracker_kind(%SymphonyElixir.GitHub.Issue{}), do: "github"
-  defp tracker_kind(%SymphonyElixir.Linear.Issue{}), do: "linear"
-
   defp tracker_kind(issue) do
-    issue
-    |> issue_field(:repository_name_with_owner)
-    |> case do
-      repo when is_binary(repo) and repo != "" -> "github"
-      _ -> Config.settings!().tracker.kind
+    case Tracker.resolve_issue_tracker_kind(issue) do
+      {:ok, tracker_kind} ->
+        tracker_kind
+
+      {:error, :missing_tracker_metadata} ->
+        if normalized_issue_context?(issue), do: nil, else: config_tracker_kind()
+
+      {:error, _reason} ->
+        nil
+    end
+  end
+
+  defp config_tracker_kind do
+    case Tracker.resolve_tracker_kind(Config.settings!().tracker) do
+      {:ok, tracker_kind} -> tracker_kind
+      {:error, _reason} -> nil
     end
   end
 
@@ -119,12 +139,37 @@ defmodule SymphonyElixir.PromptBuilder do
 
   defp default_prompt(prompt, issue) when is_binary(prompt) do
     if String.trim(prompt) == "" do
+      if missing_tracker_identity_for_normalized_issue?(issue) do
+        raise RuntimeError,
+              "issue_tracker_metadata_missing: normalized issue context requires tracker_metadata.kind"
+      end
+
       case tracker_kind(issue) do
         "github" -> @default_github_prompt
         _ -> Config.workflow_prompt()
       end
     else
       prompt
+    end
+  end
+
+  defp missing_tracker_identity_for_normalized_issue?(issue) do
+    normalized_issue_context?(issue) and
+      match?(
+        {:error, reason} when reason in [:missing_tracker_metadata, :missing_tracker_kind],
+        Tracker.resolve_issue_tracker_kind(issue)
+      )
+  end
+
+  defp normalized_issue_context?(issue) do
+    Enum.any?(@normalized_issue_context_fields, &issue_field_present?(issue, &1))
+  end
+
+  defp issue_field_present?(issue, key) do
+    case issue_field(issue, key) do
+      value when is_binary(value) -> String.trim(value) != ""
+      nil -> false
+      _ -> true
     end
   end
 end

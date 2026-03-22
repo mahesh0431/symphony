@@ -181,6 +181,7 @@ defmodule SymphonyElixir.GitHub.ClientTest do
     assert issue.state_option_id == "opt-todo"
     assert issue.repository_name_with_owner == "octo-org/example"
     assert issue.repository_default_branch == "main"
+    assert issue.tracker_metadata == %{"kind" => "github", "clone_url" => "https://github.com/octo-org/example"}
     assert issue.labels == ["orchestration"]
 
     assert issue.blocked_by == [
@@ -1162,6 +1163,7 @@ defmodule SymphonyElixir.GitHub.ClientTest do
     assert normalized.project_url == nil
     assert normalized.project_item_id == nil
     assert normalized.status_field_id == nil
+    assert normalized.tracker_metadata == %{"kind" => "github", "clone_url" => "https://github.com/octo-org/example"}
     assert normalized.labels == []
     assert normalized.blocked_by == []
     assert normalized.assigned_to_worker == false

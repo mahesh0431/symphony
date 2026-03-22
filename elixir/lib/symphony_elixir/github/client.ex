@@ -967,6 +967,7 @@ defmodule SymphonyElixir.GitHub.Client do
       project_item_id: primary_project_item_id(primary_project_item),
       status_field_id: primary_status_field_id(primary_project_item, catalog),
       status_field_name: catalog.status_field_name,
+      tracker_metadata: %{"kind" => "github", "clone_url" => repository["url"]},
       blocked_by: extract_blockers(issue),
       labels: extract_labels(issue),
       assigned_to_worker: assigned_to_worker?(assignees, tracker_assignee(catalog)),

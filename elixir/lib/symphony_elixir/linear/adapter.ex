@@ -78,6 +78,28 @@ defmodule SymphonyElixir.Linear.Adapter do
     end
   end
 
+  @spec workspace_bootstrap_clone_source(map()) :: {:ok, String.t()} | :skip | {:error, term()}
+  def workspace_bootstrap_clone_source(_issue_context), do: :skip
+
+  @spec project_urls(map()) :: [String.t()]
+  def project_urls(tracker) when is_map(tracker) do
+    case Map.get(tracker, :project_slug) || Map.get(tracker, "project_slug") do
+      project_slug when is_binary(project_slug) and project_slug != "" ->
+        ["https://linear.app/project/#{project_slug}/issues"]
+
+      _ ->
+        []
+    end
+  end
+
+  def project_urls(_tracker), do: []
+
+  @spec candidate_poll_requires_available_slots?() :: boolean()
+  def candidate_poll_requires_available_slots?, do: false
+
+  @spec runnable_active_state?(String.t()) :: boolean()
+  def runnable_active_state?(state_name) when is_binary(state_name), do: true
+
   defp client_module do
     Application.get_env(:symphony_elixir, :linear_client_module, Client)
   end
