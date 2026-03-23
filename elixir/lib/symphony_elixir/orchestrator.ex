@@ -1,6 +1,6 @@
 defmodule SymphonyElixir.Orchestrator do
   @moduledoc """
-  Polls Linear and dispatches repository copies to Codex-backed workers.
+  Polls the configured tracker and dispatches repository copies to Codex-backed workers.
   """
 
   use GenServer
@@ -270,11 +270,11 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp log_config_validation_error({:error, :missing_linear_api_token}) do
-    Logger.error("Linear API token missing in WORKFLOW.md")
+    Logger.error("Tracker API token missing in WORKFLOW.md (required for tracker.kind=linear)")
   end
 
   defp log_config_validation_error({:error, :missing_linear_project_slug}) do
-    Logger.error("Linear project slug missing in WORKFLOW.md")
+    Logger.error("Tracker project slug missing in WORKFLOW.md (required for tracker.kind=linear)")
   end
 
   defp log_config_validation_error({:error, :missing_tracker_kind}) do
@@ -1385,12 +1385,14 @@ defmodule SymphonyElixir.Orchestrator do
     !Tracker.candidate_poll_requires_available_slots?() or available_slots(state) > 0
   end
 
-  defp github_tracker_mode? do
-    Config.settings!().tracker.kind == "github"
-  end
-
   defp tracker_log_label do
-    if github_tracker_mode?(), do: "GitHub", else: "Linear"
+    case Tracker.resolve_tracker_kind(Config.settings!().tracker) do
+      {:ok, "github"} -> "GitHub"
+      {:ok, "linear"} -> "Linear"
+      {:ok, "memory"} -> "Memory"
+      {:ok, kind} -> String.capitalize(kind)
+      {:error, _reason} -> "Tracker"
+    end
   end
 
   defp github_tracker_issue?(%GitHubIssue{}), do: true

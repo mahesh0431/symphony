@@ -52,6 +52,9 @@ codex:
   header should differ.
 - This example is intentionally scoped to user-owned GitHub Projects only.
 - Keep `owner.type: user`; org-backed Projects are not supported or tested in this pass.
+- Keep each runnable GitHub issue attached to only one tracked GitHub Project item at a time.
+- If the same issue is present in more than one tracked GitHub Project, status refresh/update
+  behavior is not guaranteed in this pass.
 - Use `Backlog` as intake and `Todo` as the first runnable state.
 - When GitHub allows it, scope `Item added to project` to `issue` only and route those items to
   `Backlog`.

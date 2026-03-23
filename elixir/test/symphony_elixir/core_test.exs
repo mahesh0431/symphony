@@ -955,6 +955,11 @@ defmodule SymphonyElixir.CoreTest do
     write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "linear", tracker_project_slug: "milestone5")
 
     assert Tracker.project_urls() == ["https://linear.app/project/milestone5/issues"]
+
+    assert Tracker.project_urls(%{kind: "linear", project_slug: "milestone5"}) == [
+             "https://linear.app/project/milestone5/issues"
+           ]
+
     assert Tracker.project_urls(:invalid_tracker_shape) == []
     assert Tracker.workspace_bootstrap_clone_source(:invalid_issue_context) == :skip
     assert Tracker.runnable_active_state?(123) == false
@@ -988,6 +993,29 @@ defmodule SymphonyElixir.CoreTest do
              "tracker_metadata" => %{"kind" => "not-a-supported-kind"},
              "repository_url" => "https://github.com/octo-org/example"
            }) == {:error, {:unsupported_issue_tracker_kind, "not-a-supported-kind"}}
+
+    assert Tracker.workspace_bootstrap_clone_source(%{
+             "repository_url" => "https://github.com/octo-org/example",
+             "project_item_id" => "item-777"
+           }) == :skip
+  end
+
+  test "tracker helper fails fast for github repository context missing tracker metadata kind" do
+    write_milestone4_github_workflow!([])
+
+    assert Tracker.workspace_bootstrap_clone_source(%{
+             "repository_url" => "https://github.com/octo-org/example",
+             "repository_name_with_owner" => "octo-org/example",
+             "project_item_id" => "item-778"
+           }) == {:error, :issue_tracker_kind_missing}
+
+    assert Tracker.workspace_bootstrap_clone_source(%{
+             "project_item_id" => "item-779"
+           }) == :skip
+
+    assert Tracker.workspace_bootstrap_clone_source(%{
+             "repository_url" => 123
+           }) == {:error, :issue_tracker_kind_missing}
   end
 
   test "tracker adapter raises when workflow tracker kind cannot be resolved" do
@@ -998,7 +1026,7 @@ defmodule SymphonyElixir.CoreTest do
     end
   end
 
-  test "tracker helper derives github project urls from endpoint while keeping linear fallback behavior" do
+  test "tracker helper derives project urls from explicit tracker kind only" do
     assert Tracker.project_urls(%{
              kind: "github",
              endpoint: "https://api.github.com/graphql",
@@ -1020,7 +1048,7 @@ defmodule SymphonyElixir.CoreTest do
              projects: [%{number: 13}]
            }) == []
 
-    assert Tracker.project_urls(%{project_slug: "milestone5"}) == ["https://linear.app/project/milestone5/issues"]
+    assert Tracker.project_urls(%{project_slug: "milestone5"}) == []
   end
 
   test "github adapter handles project url and clone-source edge cases" do

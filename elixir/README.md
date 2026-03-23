@@ -58,6 +58,10 @@ This GitHub setup is intentionally narrow in the current v1 contract:
 
 - the supported and tested owner model is user-owned GitHub Projects only
 - org-backed GitHub Projects are not supported or tested in this pass
+- the supported and tested project-item shape is one tracked GitHub Project
+  item per issue at a time
+- if the same issue is present in more than one tracked GitHub Project, status
+  refresh/update behavior is not guaranteed in this pass
 - the supported and tested workspace bootstrap path is HTTPS-based repository
   bootstrap only
 - SSH clone/bootstrap is not supported or tested in this pass

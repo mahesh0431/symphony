@@ -73,7 +73,7 @@ defmodule SymphonyElixir.Tracker do
         maybe_optional(adapter_for_kind(tracker_kind), :workspace_bootstrap_clone_source, [issue_context], :skip)
 
       {:error, :missing_tracker_metadata} ->
-        :skip
+        maybe_fail_fast_missing_tracker_metadata(issue_context)
 
       {:error, :missing_tracker_kind} ->
         {:error, :issue_tracker_kind_missing}
@@ -92,14 +92,12 @@ defmodule SymphonyElixir.Tracker do
 
   @spec project_urls(term()) :: [String.t()]
   def project_urls(tracker) when is_map(tracker) do
-    fallback = default_project_urls(tracker)
-
     case resolve_tracker_kind(tracker) do
       {:ok, tracker_kind} ->
-        maybe_optional(adapter_for_kind(tracker_kind), :project_urls, [tracker], fallback)
+        maybe_optional(adapter_for_kind(tracker_kind), :project_urls, [tracker], [])
 
       {:error, _reason} ->
-        fallback
+        []
     end
   end
 
@@ -146,20 +144,12 @@ defmodule SymphonyElixir.Tracker do
   end
 
   defp maybe_optional(module, function, args, fallback) when is_atom(module) and is_atom(function) do
+    _ = Code.ensure_loaded(module)
+
     if function_exported?(module, function, length(args)) do
       apply(module, function, args)
     else
       fallback
-    end
-  end
-
-  defp default_project_urls(tracker) when is_map(tracker) do
-    case Map.get(tracker, :project_slug) || Map.get(tracker, "project_slug") do
-      project_slug when is_binary(project_slug) and project_slug != "" ->
-        ["https://linear.app/project/#{project_slug}/issues"]
-
-      _ ->
-        []
     end
   end
 
@@ -173,6 +163,34 @@ defmodule SymphonyElixir.Tracker do
   end
 
   defp explicit_tracker_kind(_source), do: nil
+
+  defp maybe_fail_fast_missing_tracker_metadata(issue_context) do
+    if github_workflow?() and repository_context?(issue_context) do
+      {:error, :issue_tracker_kind_missing}
+    else
+      :skip
+    end
+  end
+
+  defp github_workflow? do
+    case resolve_tracker_kind(Config.settings!().tracker) do
+      {:ok, "github"} -> true
+      _ -> false
+    end
+  end
+
+  defp repository_context?(issue_context) when is_map(issue_context) do
+    [:repository_name_with_owner, :repository_url, :repository_ssh_url, :repository_default_branch]
+    |> Enum.any?(fn key -> issue_context_value_present?(issue_context, key) end)
+  end
+
+  defp issue_context_value_present?(issue_context, key) when is_map(issue_context) do
+    case Map.get(issue_context, key) || Map.get(issue_context, to_string(key)) do
+      value when is_binary(value) -> String.trim(value) != ""
+      nil -> false
+      _ -> true
+    end
+  end
 
   defp tracker_metadata(source) when is_map(source) do
     case Map.get(source, :tracker_metadata) || Map.get(source, "tracker_metadata") do

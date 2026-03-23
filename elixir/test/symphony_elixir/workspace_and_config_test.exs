@@ -156,6 +156,36 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     end
   end
 
+  test "workspace fails fast for map-backed github repository context missing tracker metadata kind" do
+    workspace_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-workspace-github-missing-tracker-metadata-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      write_raw_workflow_file!(
+        Workflow.workflow_file_path(),
+        github_workflow_content(workspace_root, prompt: "Use repository context.\n")
+      )
+
+      issue = %{
+        id: "issue-3",
+        identifier: "octo-org/example#3",
+        title: "Missing tracker metadata kind",
+        project_item_id: "item-3",
+        repository_name_with_owner: "octo-org/example",
+        repository_url: "https://github.com/octo-org/example",
+        repository_default_branch: "main"
+      }
+
+      assert {:error, :issue_tracker_kind_missing} = Workspace.create_for_issue(issue)
+      refute File.exists?(Path.join(workspace_root, "octo-org_example_3"))
+    after
+      File.rm_rf(workspace_root)
+    end
+  end
+
   test "workspace does not bootstrap repositories for memory tracker issues" do
     workspace_root =
       Path.join(

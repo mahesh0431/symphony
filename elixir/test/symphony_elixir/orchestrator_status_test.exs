@@ -987,7 +987,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     refute rendered =~ "Dashboard:"
   end
 
-  test "status dashboard keeps memory project-link rendering unchanged" do
+  test "status dashboard renders no project link for memory tracker" do
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_kind: "memory",
       tracker_project_slug: "project"
@@ -1004,7 +1004,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
 
     rendered = StatusDashboard.format_snapshot_content_for_test(snapshot_data, 0.0)
 
-    assert rendered =~ "https://linear.app/project/project/issues"
+    refute rendered =~ "https://linear.app/project/project/issues"
     refute rendered =~ "https://github.com/"
   end
 
